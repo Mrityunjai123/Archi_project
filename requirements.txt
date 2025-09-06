@@ -1,6 +1,9 @@
 streamlit
 opencv-python-headless
 numpy
+pdf2image==3.1.0
+Pillow
 pandas
 requests
-Pillow
+PyPDF2
+matplotlib
