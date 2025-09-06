@@ -1,7 +1,7 @@
 import streamlit as st
 import cv2
 import numpy as np
-from pdf2image import convert_from_bytes, convert_from_path
+import fitz 
 import io
 from PIL import Image, ImageFile
 import os
@@ -162,66 +162,54 @@ LIVINGSTON_ZONING_REQUIREMENTS = {
 }
 
 class PDFtoImageConverter:
-    """Convert PDF to high-resolution images"""
+    """Convert PDF to high-resolution images using PyMuPDF"""
     
-    def __init__(self, dpi=600):
+    def __init__(self, dpi=300):
         self.dpi = dpi
     
-    def convert_pdf_to_images(self, pdf_file, max_dimension=8000):
+    def convert_pdf_to_images(self, pdf_file, max_dimension=4000):
         try:
-            poppler_path = None
-            if os.name == 'nt':  # Windows
-                potential_paths = [
-                    r"C:\Program Files\poppler-25.07.0\Library\bin",
-                    r"C:\Program Files\poppler\bin",
-                    r"C:\poppler\bin",
-                    r"C:\poppler-25.07.0\Library\bin",
-                    r"C:\Program Files (x86)\poppler\bin"
-                ]
-                for path in potential_paths:
-                    if os.path.exists(path) and os.path.exists(os.path.join(path, "pdftoppm.exe")):
-                        poppler_path = path
-                        break
-            
+            # Use PyMuPDF instead of pdf2image
             if isinstance(pdf_file, bytes):
-                if poppler_path:
-                    images = convert_from_bytes(pdf_file, dpi=self.dpi, poppler_path=poppler_path)
-                else:
-                    images = convert_from_bytes(pdf_file, dpi=self.dpi)
+                pdf_document = fitz.open(stream=pdf_file, filetype="pdf")
             else:
-                if poppler_path:
-                    images = convert_from_path(pdf_file, dpi=self.dpi, poppler_path=poppler_path)
-                else:
-                    images = convert_from_path(pdf_file, dpi=self.dpi)
+                pdf_document = fitz.open(pdf_file)
             
             processed_images = []
             
-            for i, image in enumerate(images):
+            for page_num in range(len(pdf_document)):
+                page = pdf_document.load_page(page_num)
+                
+                # Convert to image with specified DPI
+                mat = fitz.Matrix(self.dpi/72, self.dpi/72)
+                pix = page.get_pixmap(matrix=mat)
+                img_data = pix.tobytes("png")
+                
+                # Convert to PIL Image
+                image = Image.open(io.BytesIO(img_data))
                 original_w, original_h = image.size
-                st.info(f"Page {i+1}: Original size {original_w}x{original_h} ({(original_w*original_h)/1_000_000:.1f}M pixels)")
                 
-                img_array = np.array(image)
+                st.info(f"Page {page_num+1}: Original size {original_w}x{original_h} ({(original_w*original_h)/1_000_000:.1f}M pixels)")
                 
-                h, w = img_array.shape[:2]
-                if h > max_dimension or w > max_dimension:
-                    if h > w:
+                # Resize if too large
+                if original_w > max_dimension or original_h > max_dimension:
+                    if original_h > original_w:
                         new_h = max_dimension
-                        new_w = int(w * (new_h / h))
+                        new_w = int(original_w * (new_h / original_h))
                     else:
                         new_w = max_dimension
-                        new_h = int(h * (new_w / w))
+                        new_h = int(original_h * (new_w / original_w))
                     
-                    img_array = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
                 
-                processed_image = Image.fromarray(img_array)
-                processed_images.append(processed_image)
-                
+                processed_images.append(image)
+            
+            pdf_document.close()
             return processed_images
             
         except Exception as e:
             st.error(f"Error converting PDF: {str(e)}")
             return []
-
 class YOLOv8Pipeline:
     """YOLOv8 Inference Pipeline with Zone Detection"""
     
