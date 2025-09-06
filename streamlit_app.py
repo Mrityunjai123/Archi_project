@@ -1735,7 +1735,7 @@ def main():
     st.sidebar.header("Configuration")
     
     # Model path - Updated to use user's specific model
-    model_path = "models/custom_yolov8_final.pt"
+    model_path = "model/custom_yolov8_final.pt"
     
     if os.path.exists(model_path):
         st.sidebar.success(f"✅ Using custom YOLO model: {os.path.basename(model_path)}")
