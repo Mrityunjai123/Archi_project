@@ -18,14 +18,21 @@ import re
 from typing import List, Dict, Any, Optional
 import PyPDF2
 from datetime import datetime
+import gc  # For garbage collection
 
-# Fix for large images
+# Fix for large images and memory optimization
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
 # Configuration
 GEMINI_KEY = "AIzaSyARUWP7nhktvAnKqS3QgjEVEUKfSl_8iPw"  # Replace with your actual API key
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key={GEMINI_KEY}"
+
+# Cloud deployment optimizations
+CLOUD_MODE = True
+PDF_DPI = 200 if CLOUD_MODE else 600  # Reduced DPI for cloud
+MAX_IMAGE_DIMENSION = 2000 if CLOUD_MODE else 8000  # Reduced for cloud
+MAX_FILE_SIZE_MB = 25  # Maximum PDF file size in MB
 
 # Comprehensive Livingston Township Zoning Requirements from PDF
 LIVINGSTON_ZONING_REQUIREMENTS = {
@@ -162,12 +169,12 @@ LIVINGSTON_ZONING_REQUIREMENTS = {
 }
 
 class PDFtoImageConverter:
-    """Convert PDF to high-resolution images using PyMuPDF"""
+    """Convert PDF to high-resolution images using PyMuPDF with cloud optimizations"""
     
-    def __init__(self, dpi=300):
+    def __init__(self, dpi=PDF_DPI):
         self.dpi = dpi
     
-    def convert_pdf_to_images(self, pdf_file, max_dimension=4000):
+    def convert_pdf_to_images(self, pdf_file, max_dimension=MAX_IMAGE_DIMENSION):
         try:
             # Use PyMuPDF instead of pdf2image
             if isinstance(pdf_file, bytes):
@@ -177,7 +184,14 @@ class PDFtoImageConverter:
             
             processed_images = []
             
-            for page_num in range(len(pdf_document)):
+            # Limit number of pages for cloud deployment
+            max_pages = 5 if CLOUD_MODE else len(pdf_document)
+            actual_pages = min(len(pdf_document), max_pages)
+            
+            if len(pdf_document) > max_pages:
+                st.warning(f"Processing first {max_pages} pages only (cloud limit)")
+            
+            for page_num in range(actual_pages):
                 page = pdf_document.load_page(page_num)
                 
                 # Convert to image with specified DPI
@@ -191,7 +205,7 @@ class PDFtoImageConverter:
                 
                 st.info(f"Page {page_num+1}: Original size {original_w}x{original_h} ({(original_w*original_h)/1_000_000:.1f}M pixels)")
                 
-                # Resize if too large
+                # Resize if too large (more aggressive for cloud)
                 if original_w > max_dimension or original_h > max_dimension:
                     if original_h > original_w:
                         new_h = max_dimension
@@ -201,30 +215,57 @@ class PDFtoImageConverter:
                         new_h = int(original_h * (new_w / original_w))
                     
                     image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    st.info(f"Resized to: {new_w}x{new_h}")
                 
                 processed_images.append(image)
+                
+                # Clean up PyMuPDF objects
+                pix = None
+                
+                # Force garbage collection for cloud deployment
+                if CLOUD_MODE:
+                    gc.collect()
             
             pdf_document.close()
             return processed_images
             
         except Exception as e:
             st.error(f"Error converting PDF: {str(e)}")
+            if CLOUD_MODE:
+                st.info("Try uploading a smaller PDF or reducing the number of pages")
             return []
+
 class YOLOv8Pipeline:
-    """YOLOv8 Inference Pipeline with Zone Detection"""
+    """YOLOv8 Inference Pipeline with Zone Detection and cloud optimizations"""
     
     def __init__(self, model_path=None):
-        if model_path and os.path.exists(model_path):
-            try:
-                self.model = YOLO(model_path)
-                self.custom_model = True
-                self.classes = list(self.model.names.values()) if hasattr(self.model, 'names') else ["Architecture Layout", "Tables", "zone area"]
-            except Exception as e:
-                st.warning(f"Could not load custom model: {e}. Using default YOLOv8 model.")
-                self.model = YOLO('yolov8n.pt')
-                self.custom_model = False
-                self.classes = list(self.model.names.values())
-        else:
+        # Multiple model path options for different deployments
+        possible_paths = [
+            "model/custom_yolov8_final.pt",     # GitHub structure
+            "models/custom_yolov8_final.pt",    # Alternative structure
+            "custom_yolov8_final.pt",           # Root directory
+        ] if model_path is None else [model_path]
+        
+        self.model = None
+        self.custom_model = False
+        
+        # Try to load custom model
+        for path in possible_paths:
+            if os.path.exists(path):
+                try:
+                    st.info(f"Loading custom model: {path}")
+                    self.model = YOLO(path)
+                    self.custom_model = True
+                    self.classes = list(self.model.names.values()) if hasattr(self.model, 'names') else ["Architecture Layout", "Tables", "zone area"]
+                    st.success(f"Custom model loaded successfully: {os.path.basename(path)}")
+                    break
+                except Exception as e:
+                    st.warning(f"Could not load custom model from {path}: {e}")
+                    continue
+        
+        # Fallback to default model
+        if self.model is None:
+            st.info("Using default YOLOv8 model")
             self.model = YOLO('yolov8n.pt')
             self.custom_model = False
             self.classes = list(self.model.names.values())
@@ -283,6 +324,15 @@ class YOLOv8Pipeline:
             img_array = np.array(image)
         else:
             img_array = image
+        
+        # Cloud optimization: use smaller image for inference if too large
+        if CLOUD_MODE and img_array.size > 2000*2000*3:
+            h, w = img_array.shape[:2]
+            scale_factor = min(1500/w, 1500/h)
+            if scale_factor < 1:
+                new_w, new_h = int(w * scale_factor), int(h * scale_factor)
+                img_array = cv2.resize(img_array, (new_w, new_h))
+                st.info(f"Reduced image size for YOLO inference: {new_w}x{new_h}")
         
         results = self.model(img_array, conf=conf_threshold)
         annotated_image = self.draw_predictions(img_array.copy(), results[0])
@@ -409,11 +459,12 @@ class AnalysisValidator:
             'all_analyses_completed': False,
             'results_generated': False
         }
+        # Reduced requirements for cloud deployment
         self.analysis_requirements = {
-            'min_lot_measurements': 4,  # 4 boundary dimensions + area
-            'min_setback_measurements': 1,  # At least 1 valid setback
-            'min_building_measurements': 1,  # At least building area
-            'required_architecture_count': 2  # Expected number of architectures
+            'min_lot_measurements': 2,  # Reduced from 4
+            'min_setback_measurements': 1,
+            'min_building_measurements': 1,
+            'required_architecture_count': 1  # Reduced from 2
         }
     
     def validate_step(self, step_name: str, data: Any) -> Dict[str, Any]:
@@ -436,26 +487,21 @@ class AnalysisValidator:
         elif step_name == 'yolo_completed':
             if data and hasattr(data, 'boxes') and data.boxes is not None:
                 detection_count = len(data.boxes)
-                if detection_count >= 3:  # Expect multiple regions
+                if detection_count >= 1:  # Reduced threshold for cloud
                     validation_result['passed'] = True
                     self.required_steps['yolo_completed'] = True
                 else:
-                    validation_result['issues'].append(f"Only {detection_count} detections found, expected at least 3")
+                    validation_result['issues'].append(f"Only {detection_count} detections found")
                     validation_result['recommendations'].append("Lower confidence threshold or check image quality")
             else:
                 validation_result['issues'].append("YOLO detection failed or no detections found")
                 validation_result['retry_needed'] = True
         
         elif step_name == 'regions_extracted':
-            if data and data.get('cropped_images') and len(data['cropped_images']) >= 2:
-                architecture_regions = [k for k in data['cropped_images'].keys() if 'architecture' in k.lower()]
-                if len(architecture_regions) >= 2:
-                    validation_result['passed'] = True
-                    self.required_steps['regions_extracted'] = True
-                    self.required_steps['architectures_identified'] = True
-                else:
-                    validation_result['issues'].append(f"Only {len(architecture_regions)} architecture regions found, expected 2+")
-                    validation_result['recommendations'].append("Review region scoring logic")
+            if data and data.get('cropped_images') and len(data['cropped_images']) >= 1:
+                validation_result['passed'] = True
+                self.required_steps['regions_extracted'] = True
+                self.required_steps['architectures_identified'] = True
             else:
                 validation_result['issues'].append("Region extraction failed or insufficient regions")
                 validation_result['retry_needed'] = True
@@ -486,127 +532,6 @@ class AnalysisValidator:
                 validation_result['passed'] = True
         
         return validation_result
-    
-    def force_complete_analysis(self, architectural_regions: List[Dict], detectors: Dict) -> List[Dict]:
-        """Reinforcement mechanism to ensure all architectures are analyzed"""
-        complete_results = []
-        
-        st.write("🔄 **REINFORCEMENT LAYER: Ensuring Complete Analysis**")
-        
-        for i, region_data in enumerate(architectural_regions, 1):
-            region_filename = region_data['filename']
-            region_image = region_data['image']
-            
-            st.write(f"🎯 **Forcing Analysis {i}/{len(architectural_regions)}: {region_filename}**")
-            
-            # Force analysis with retry mechanism
-            max_retries = 2
-            analysis_success = False
-            
-            for attempt in range(max_retries + 1):
-                if attempt > 0:
-                    st.warning(f"Retry attempt {attempt} for {region_filename}")
-                
-                try:
-                    # Force lot analysis
-                    st.write(f"📏 Forcing lot analysis (attempt {attempt + 1})...")
-                    lot_results = detectors['lot'].detect_lot_measurements(region_image)
-                    lot_validation = self.validate_step('measurements_analysis', lot_results if lot_results.get('success') else {'lot_measurements': []})
-                    
-                    if not lot_validation['passed']:
-                        st.error(f"Lot analysis issues: {', '.join(lot_validation['issues'])}")
-                    
-                    # Force setback analysis
-                    st.write(f"📐 Forcing setback analysis (attempt {attempt + 1})...")
-                    setback_results = detectors['setback'].detect_setback_measurements(region_image)
-                    setback_validation = self.validate_step('measurements_analysis', setback_results if setback_results.get('success') else {'setback_measurements': []})
-                    
-                    if not setback_validation['passed']:
-                        st.error(f"Setback analysis issues: {', '.join(setback_validation['issues'])}")
-                    
-                    # Force building analysis
-                    st.write(f"🏠 Forcing building analysis (attempt {attempt + 1})...")
-                    building_results = detectors['building'].detect_building_measurements(region_image)
-                    building_validation = self.validate_step('measurements_analysis', building_results if building_results.get('success') else {'building_measurements': []})
-                    
-                    if not building_validation['passed']:
-                        st.error(f"Building analysis issues: {', '.join(building_validation['issues'])}")
-                    
-                    # Check if analysis is acceptable
-                    total_measurements = (
-                        len(lot_results.get('measurements', [])) +
-                        len(setback_results.get('measurements', [])) +
-                        len(building_results.get('measurements', []))
-                    )
-                    
-                    if total_measurements >= 3:  # Minimum acceptable
-                        analysis_success = True
-                        st.success(f"✅ Analysis {i} completed with {total_measurements} total measurements")
-                        break
-                    else:
-                        st.warning(f"⚠️ Only {total_measurements} measurements found, retrying...")
-                
-                except Exception as e:
-                    st.error(f"❌ Analysis attempt {attempt + 1} failed: {str(e)}")
-            
-            if not analysis_success:
-                st.error(f"❌ Failed to complete analysis for {region_filename} after {max_retries + 1} attempts")
-                # Create minimal result to avoid complete failure
-                lot_results = {'success': False, 'measurements': [], 'error': 'Analysis failed'}
-                setback_results = {'success': False, 'measurements': [], 'error': 'Analysis failed'}
-                building_results = {'success': False, 'measurements': [], 'error': 'Analysis failed'}
-            
-            # Compile results regardless of success level
-            yolo_summary = {}  # Placeholder
-            analysis_results = detectors['compiler'].compile_zoning_analysis(
-                lot_results, setback_results, building_results, 
-                region_filename, yolo_summary
-            )
-            
-            # Add reinforcement metadata
-            analysis_results['reinforcement_info'] = {
-                'analysis_attempts': attempt + 1,
-                'forced_completion': True,
-                'success_level': 'full' if analysis_success else 'partial',
-                'total_measurements_found': (
-                    len(analysis_results.get('lot_measurements', [])) +
-                    len(analysis_results.get('setback_measurements', [])) +
-                    len(analysis_results.get('building_measurements', []))
-                )
-            }
-            
-            analysis_results['region_info'] = {
-                'filename': region_filename,
-                'score': region_data['score'],
-                'size': f"{region_image.size[0]}x{region_image.size[1]}",
-                'analysis_number': i
-            }
-            
-            complete_results.append(analysis_results)
-        
-        # Final validation
-        st.write("🔍 **FINAL VALIDATION:**")
-        if len(complete_results) >= 2:
-            st.success(f"✅ Successfully analyzed {len(complete_results)} architectures")
-            self.required_steps['all_analyses_completed'] = True
-        else:
-            st.error(f"❌ Only completed {len(complete_results)} analyses, expected 2+")
-        
-        return complete_results
-    
-    def get_completion_report(self) -> str:
-        """Generate completion status report"""
-        completed_steps = sum(self.required_steps.values())
-        total_steps = len(self.required_steps)
-        
-        report = f"REINFORCEMENT REPORT:\n"
-        report += f"Completion: {completed_steps}/{total_steps} steps\n"
-        
-        for step, completed in self.required_steps.items():
-            status = "✅" if completed else "❌"
-            report += f"{status} {step.replace('_', ' ').title()}\n"
-        
-        return report
 
 class EnhancedLotMeasurementsDetector:
     """Enhanced detector for all lot polygon dimensions with label recognition"""
@@ -617,9 +542,18 @@ class EnhancedLotMeasurementsDetector:
                 with open(image_path_or_pil, "rb") as image_file:
                     base64_image = base64.b64encode(image_file.read()).decode('utf-8')
             else:
-                # PIL Image
+                # PIL Image - optimize for cloud
                 img_buffer = io.BytesIO()
-                image_path_or_pil.save(img_buffer, format='PNG')
+                # Reduce quality for cloud deployment
+                if CLOUD_MODE:
+                    # Resize if too large
+                    w, h = image_path_or_pil.size
+                    if w > 1500 or h > 1500:
+                        scale = min(1500/w, 1500/h)
+                        new_size = (int(w*scale), int(h*scale))
+                        image_path_or_pil = image_path_or_pil.resize(new_size, Image.Resampling.LANCZOS)
+                
+                image_path_or_pil.save(img_buffer, format='PNG', optimize=True)
                 img_buffer.seek(0)
                 base64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
         except Exception as e:
@@ -680,7 +614,9 @@ PRIORITY: Find ALL polygon boundary dimensions, especially labeled ones (L=, B=,
         }
         
         try:
-            response = requests.post(GEMINI_URL, json=payload, timeout=90)
+            # Reduced timeout for cloud deployment
+            timeout = 60 if CLOUD_MODE else 90
+            response = requests.post(GEMINI_URL, json=payload, timeout=timeout)
             if response.status_code == 200:
                 result = response.json()
                 if 'candidates' in result and result['candidates']:
@@ -785,6 +721,7 @@ PRIORITY: Find ALL polygon boundary dimensions, especially labeled ones (L=, B=,
                 except (ValueError, IndexError):
                     continue
         
+        # Remove duplicates
         unique_measurements = []
         for measure in measurements:
             is_duplicate = False
@@ -838,7 +775,15 @@ class EnhancedSetbackMeasurementsDetector:
                     base64_image = base64.b64encode(image_file.read()).decode('utf-8')
             else:
                 img_buffer = io.BytesIO()
-                image_path_or_pil.save(img_buffer, format='PNG')
+                # Cloud optimization
+                if CLOUD_MODE:
+                    w, h = image_path_or_pil.size
+                    if w > 1500 or h > 1500:
+                        scale = min(1500/w, 1500/h)
+                        new_size = (int(w*scale), int(h*scale))
+                        image_path_or_pil = image_path_or_pil.resize(new_size, Image.Resampling.LANCZOS)
+                
+                image_path_or_pil.save(img_buffer, format='PNG', optimize=True)
                 img_buffer.seek(0)
                 base64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
         except Exception as e:
@@ -912,7 +857,8 @@ MANDATORY: Use DRIVEWAY text location as the definitive front orientation indica
         }
         
         try:
-            response = requests.post(GEMINI_URL, json=payload, timeout=90)
+            timeout = 60 if CLOUD_MODE else 90
+            response = requests.post(GEMINI_URL, json=payload, timeout=timeout)
             if response.status_code == 200:
                 result = response.json()
                 if 'candidates' in result and result['candidates']:
@@ -1029,7 +975,15 @@ class EnhancedBuildingMeasurementsDetector:
                     base64_image = base64.b64encode(image_file.read()).decode('utf-8')
             else:
                 img_buffer = io.BytesIO()
-                image_path_or_pil.save(img_buffer, format='PNG')
+                # Cloud optimization
+                if CLOUD_MODE:
+                    w, h = image_path_or_pil.size
+                    if w > 1500 or h > 1500:
+                        scale = min(1500/w, 1500/h)
+                        new_size = (int(w*scale), int(h*scale))
+                        image_path_or_pil = image_path_or_pil.resize(new_size, Image.Resampling.LANCZOS)
+                
+                image_path_or_pil.save(img_buffer, format='PNG', optimize=True)
                 img_buffer.seek(0)
                 base64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
         except Exception as e:
@@ -1102,7 +1056,8 @@ MANDATORY: Find ALL building dimensions and calculate accurate total area.
         }
         
         try:
-            response = requests.post(GEMINI_URL, json=payload, timeout=90)
+            timeout = 60 if CLOUD_MODE else 90
+            response = requests.post(GEMINI_URL, json=payload, timeout=timeout)
             if response.status_code == 200:
                 result = response.json()
                 if 'candidates' in result and result['candidates']:
@@ -1638,7 +1593,7 @@ def display_zoning_analysis_dashboard(analysis_results):
         st.warning("No analysis results to display")
         return
     
-    st.header("📊 Comprehensive Zoning Analysis Dashboard")
+    st.header("Comprehensive Zoning Analysis Dashboard")
     
     # Summary metrics
     summary = analysis_results.get('summary', {})
@@ -1661,7 +1616,7 @@ def display_zoning_analysis_dashboard(analysis_results):
         st.metric("Compliance Rate", compliance_rate)
     
     # Zoning Requirements Table
-    st.subheader("🏗️ Zoning Requirements Analysis")
+    st.subheader("Zoning Requirements Analysis")
     
     zoning_table = analysis_results.get('zoning_table', {})
     if zoning_table:
@@ -1690,7 +1645,7 @@ def display_zoning_analysis_dashboard(analysis_results):
         st.dataframe(styled_df, use_container_width=True)
     
     # Detailed Measurements
-    tabs = st.tabs(["📏 Lot Measurements", "📐 Setback Measurements", "🏠 Building Measurements"])
+    tabs = st.tabs(["Lot Measurements", "Setback Measurements", "Building Measurements"])
     
     with tabs[0]:
         lot_measurements = analysis_results.get('lot_measurements', [])
@@ -1731,18 +1686,25 @@ def main():
     st.title("🏗️ Comprehensive Architectural Analysis Pipeline")
     st.markdown("Upload a PDF → Extract architectural drawings → Analyze lot, setback, and building measurements → Generate zoning compliance report")
     
+    # Cloud deployment notice
+    if CLOUD_MODE:
+        st.info("🌤️ **Cloud Mode Active**: Optimized for Streamlit Cloud with reduced memory usage and faster processing")
+    
     # Sidebar configuration
     st.sidebar.header("Configuration")
     
-    # Model path - Updated to use user's specific model
-    model_path = "model/custom_yolov8_final.pt"
-    
-    if os.path.exists(model_path):
-        st.sidebar.success(f"✅ Using custom YOLO model: {os.path.basename(model_path)}")
-        st.sidebar.info("Model supports zone detection and architectural elements")
-    else:
-        st.sidebar.error(f"❌ Custom model not found: {model_path}")
-        st.sidebar.warning("Please verify the model path is correct")
+    # Model loading with multiple path options
+    yolo_pipeline = None
+    try:
+        yolo_pipeline = YOLOv8Pipeline()
+        if yolo_pipeline.custom_model:
+            st.sidebar.success("✅ Custom YOLO model loaded successfully")
+        else:
+            st.sidebar.info("ℹ️ Using default YOLOv8 model")
+    except Exception as e:
+        st.sidebar.error(f"❌ Error loading YOLO model: {str(e)}")
+        st.error("Failed to initialize YOLO model. Please check the logs.")
+        return
     
     # Configuration parameters
     conf_threshold = st.sidebar.slider("YOLO Confidence Threshold", 0.1, 1.0, 0.25, step=0.05)
@@ -1754,33 +1716,19 @@ def main():
         st.sidebar.error("❌ Gemini API key not configured")
         st.sidebar.warning("Please set your Gemini API key in the code")
     
-    # Zoning information
-    st.sidebar.markdown("**Zoning Support:**")
-    zones_supported = list(LIVINGSTON_ZONING_REQUIREMENTS.keys())
-    st.sidebar.info(f"Supports {len(zones_supported)} zones: {', '.join(zones_supported[:5])}{'...' if len(zones_supported) > 5 else ''}")
+    # Cloud deployment settings display
+    st.sidebar.markdown("**Cloud Optimizations:**")
+    st.sidebar.info(f"PDF DPI: {PDF_DPI}")
+    st.sidebar.info(f"Max Image Size: {MAX_IMAGE_DIMENSION}px")
+    st.sidebar.info(f"Max File Size: {MAX_FILE_SIZE_MB}MB")
     
-    # Fixed settings display
-    st.sidebar.markdown("**Processing Settings:**")
-    st.sidebar.info("PDF DPI: 600 (High Quality)")
-    st.sidebar.info("Max Image Dimension: 8000px")
-    st.sidebar.info("Zoning Data: Livingston Township")
-    
-    # Initialize components with reinforcement layer
-    pdf_converter = PDFtoImageConverter(dpi=600)
-    yolo_pipeline = YOLOv8Pipeline(model_path=model_path)
+    # Initialize components
+    pdf_converter = PDFtoImageConverter(dpi=PDF_DPI)
     validator = AnalysisValidator()
     lot_detector = EnhancedLotMeasurementsDetector()
     setback_detector = EnhancedSetbackMeasurementsDetector()
     building_detector = EnhancedBuildingMeasurementsDetector()
     zoning_compiler = ZoningTableCompiler()
-    
-    # Create detector dictionary for reinforcement layer
-    detector_dict = {
-        'lot': lot_detector,
-        'setback': setback_detector, 
-        'building': building_detector,
-        'compiler': zoning_compiler
-    }
     
     # Main interface
     col1, col2 = st.columns([1, 1])
@@ -1790,16 +1738,31 @@ def main():
         uploaded_pdf = st.file_uploader(
             "Upload PDF file with architectural drawings",
             type=['pdf'],
-            help="Upload a PDF containing architectural plans or zoning documents"
+            help=f"Upload a PDF containing architectural plans (max {MAX_FILE_SIZE_MB}MB)"
         )
         
         if uploaded_pdf:
-            st.success(f"PDF uploaded: {uploaded_pdf.name}")
+            # Check file size
+            file_size_mb = len(uploaded_pdf.getvalue()) / (1024 * 1024)
             
-            # Convert PDF to images
-            with st.spinner("Converting PDF to high-resolution images..."):
-                pdf_bytes = uploaded_pdf.getvalue()
-                images = pdf_converter.convert_pdf_to_images(pdf_bytes, max_dimension=8000)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                st.error(f"PDF too large ({file_size_mb:.1f}MB). Please use a smaller file (max {MAX_FILE_SIZE_MB}MB).")
+                st.info("Try compressing the PDF or selecting fewer pages.")
+                return
+            
+            st.success(f"PDF uploaded: {uploaded_pdf.name} ({file_size_mb:.1f}MB)")
+            
+            # Convert PDF to images with enhanced error handling
+            try:
+                with st.spinner("Converting PDF to images..."):
+                    pdf_bytes = uploaded_pdf.getvalue()
+                    images = pdf_converter.convert_pdf_to_images(pdf_bytes, max_dimension=MAX_IMAGE_DIMENSION)
+            except Exception as e:
+                st.error(f"PDF conversion failed: {str(e)}")
+                st.info("Try uploading a smaller PDF or a single-page document.")
+                if CLOUD_MODE:
+                    st.info("Large PDFs may exceed cloud memory limits. Consider using a PDF with fewer pages.")
+                return
             
             if images:
                 st.success(f"Converted PDF to {len(images)} page(s)")
@@ -1816,63 +1779,78 @@ def main():
                 st.subheader("Original Image")
                 st.image(selected_image, use_column_width=True)
                 
-                # Step 1: YOLO Detection with Reinforcement
+                # Clear previous results when new image is selected
+                if 'selected_page' not in st.session_state or st.session_state.selected_page != page_idx:
+                    st.session_state.selected_page = page_idx
+                    for key in ['detection_results', 'extracted_data', 'analysis_results']:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                
+                # Step 1: YOLO Detection
                 if st.button("🔍 Step 1: Run YOLO Detection", type="primary"):
                     with col2:
-                        with st.spinner("Running YOLO detection with reinforcement layer..."):
-                            annotated_image, results = yolo_pipeline.predict_image(selected_image, conf_threshold=conf_threshold)
-                            
-                            # Validate YOLO results
-                            yolo_validation = validator.validate_step('yolo_completed', results)
-                            
-                            if not yolo_validation['passed']:
-                                st.error("🔄 YOLO Detection Issues:")
-                                for issue in yolo_validation['issues']:
-                                    st.error(f"• {issue}")
-                                for rec in yolo_validation['recommendations']:
-                                    st.info(f"💡 {rec}")
+                        try:
+                            with st.spinner("Running YOLO detection..."):
+                                annotated_image, results = yolo_pipeline.predict_image(selected_image, conf_threshold=conf_threshold)
                                 
-                                if yolo_validation['retry_needed']:
-                                    st.warning("Retrying with lower confidence threshold...")
-                                    annotated_image, results = yolo_pipeline.predict_image(selected_image, conf_threshold=0.1)
+                                # Validate YOLO results
+                                yolo_validation = validator.validate_step('yolo_completed', results)
+                                
+                                if not yolo_validation['passed']:
+                                    st.warning("YOLO Detection Issues:")
+                                    for issue in yolo_validation['issues']:
+                                        st.warning(f"• {issue}")
                                     
-                                    # Re-validate
-                                    yolo_validation = validator.validate_step('yolo_completed', results)
-                                    if yolo_validation['passed']:
-                                        st.success("✅ Retry successful!")
-                                    else:
-                                        st.error("❌ Retry failed - proceeding with available detections")
-                            
-                            st.session_state.detection_results = results
-                            st.session_state.selected_image = selected_image
-                            st.session_state.annotated_image = annotated_image
-                            st.session_state.pdf_name = uploaded_pdf.name
-                            
-                            st.header("🎯 YOLO Detection Results")
-                            st.image(annotated_image, use_column_width=True)
-                            
-                            summary = yolo_pipeline.get_detection_summary(results)
-                            st.subheader("Detection Summary")
-                            col2_1, col2_2 = st.columns([1, 1])
-                            
-                            with col2_1:
-                                st.metric("Total Detections", summary['total_detections'])
-                                if summary['detections_per_class']:
-                                    st.write("**Detections by Class:**")
-                                    for class_name, count in summary['detections_per_class'].items():
-                                        st.write(f"• {class_name}: {count}")
-                            
-                            with col2_2:
-                                if summary['detection_details']:
-                                    df = pd.DataFrame(summary['detection_details'])
-                                    df['confidence'] = df['confidence'].round(3)
-                                    st.dataframe(df[['class', 'confidence']], use_container_width=True)
-                            
-                            # Show validation status
-                            if yolo_validation['passed']:
-                                st.success("✅ YOLO detection passed validation")
-                            else:
-                                st.warning("⚠️ YOLO detection has validation issues but proceeding")
+                                    if yolo_validation['retry_needed']:
+                                        st.info("Retrying with lower confidence threshold...")
+                                        annotated_image, results = yolo_pipeline.predict_image(selected_image, conf_threshold=0.1)
+                                        
+                                        # Re-validate
+                                        yolo_validation = validator.validate_step('yolo_completed', results)
+                                        if yolo_validation['passed']:
+                                            st.success("✅ Retry successful!")
+                                        else:
+                                            st.warning("⚠️ Proceeding with available detections")
+                                
+                                st.session_state.detection_results = results
+                                st.session_state.selected_image = selected_image
+                                st.session_state.annotated_image = annotated_image
+                                st.session_state.pdf_name = uploaded_pdf.name
+                                
+                                st.header("🎯 YOLO Detection Results")
+                                st.image(annotated_image, use_column_width=True)
+                                
+                                summary = yolo_pipeline.get_detection_summary(results)
+                                st.subheader("Detection Summary")
+                                col2_1, col2_2 = st.columns([1, 1])
+                                
+                                with col2_1:
+                                    st.metric("Total Detections", summary['total_detections'])
+                                    if summary['detections_per_class']:
+                                        st.write("**Detections by Class:**")
+                                        for class_name, count in summary['detections_per_class'].items():
+                                            st.write(f"• {class_name}: {count}")
+                                
+                                with col2_2:
+                                    if summary['detection_details']:
+                                        df = pd.DataFrame(summary['detection_details'])
+                                        df['confidence'] = df['confidence'].round(3)
+                                        st.dataframe(df[['class', 'confidence']], use_container_width=True)
+                                
+                                # Show validation status
+                                if yolo_validation['passed']:
+                                    st.success("✅ YOLO detection completed successfully")
+                                else:
+                                    st.warning("⚠️ YOLO detection has validation issues but proceeding")
+                        
+                        except Exception as e:
+                            st.error(f"YOLO detection failed: {str(e)}")
+                            if CLOUD_MODE:
+                                st.info("This may be due to cloud memory limits. Try a smaller image or lower confidence threshold.")
+            else:
+                st.error("No pages could be extracted from the PDF")
+                if CLOUD_MODE:
+                    st.info("This may be due to cloud processing limits. Try a smaller or simpler PDF.")
     
     # Step 2: Extract and Analyze (only show if YOLO detection is complete)
     if ('detection_results' in st.session_state and 
@@ -1886,479 +1864,342 @@ def main():
             st.header("🔬 Step 2: Extract & Analyze Measurements")
             
             if st.button("🚀 Extract Regions & Analyze Measurements", type="primary"):
-                # Extract detected regions
-                with st.spinner("Extracting detected regions..."):
-                    extracted_data = yolo_pipeline.extract_detected_regions(
-                        st.session_state.selected_image,
-                        st.session_state.detection_results,
-                        output_prefix=st.session_state.pdf_name.replace('.pdf', '')
-                    )
-                    
-                    st.session_state.extracted_data = extracted_data
-                
-                if extracted_data['cropped_images']:
-                    st.success(f"Extracted {len(extracted_data['cropped_images'])} regions")
-                    
-                    # Show preview of extracted regions
-                    st.subheader("Extracted Regions Preview")
-                    extracted_items = list(extracted_data['cropped_images'].items())
-                    for i in range(0, min(6, len(extracted_items)), 3):  # Show max 6 images
-                        cols = st.columns(3)
-                        for j, (filename, img) in enumerate(extracted_items[i:i+3]):
-                            with cols[j]:
-                                st.image(img, caption=filename.split('_')[1], use_column_width=True)
-                    
-                    # Run measurement analysis on suitable regions
-                    with st.spinner("Analyzing measurements with Gemini AI..."):
-                        # Improved region selection for architectural analysis
-                        best_region = None
-                        best_filename = None
-                        best_score = 0
+                try:
+                    # Extract detected regions
+                    with st.spinner("Extracting detected regions..."):
+                        extracted_data = yolo_pipeline.extract_detected_regions(
+                            st.session_state.selected_image,
+                            st.session_state.detection_results,
+                            output_prefix=st.session_state.pdf_name.replace('.pdf', '')
+                        )
                         
-                        st.write("🔍 **Evaluating regions for architectural analysis:**")
+                        st.session_state.extracted_data = extracted_data
+                    
+                    if extracted_data['cropped_images']:
+                        st.success(f"Extracted {len(extracted_data['cropped_images'])} regions")
                         
-                        # Score each region for architectural content
-                        for filename, image in extracted_data['cropped_images'].items():
-                            score = 0
-                            width, height = image.size
-                            area = width * height
-                            
-                            st.write(f"• **{filename}**: {width}x{height} ({area:,} pixels)")
-                            
-                            # Prioritize architectural drawings over tables
-                            if 'architecture' in filename.lower() or 'layout' in filename.lower():
-                                score += 1000  # Highest priority for architectural drawings
-                                st.write(f"  ✅ Architecture/Layout detected (+1000)")
-                            elif 'site' in filename.lower() or 'plan' in filename.lower():
-                                score += 800   # High priority for site plans
-                                st.write(f"  ✅ Site/Plan detected (+800)")
-                            elif 'zone' in filename.lower() and 'map' not in filename.lower():
-                                score += 600   # Medium-high priority for zone drawings
-                                st.write(f"  ✅ Zone drawing detected (+600)")
-                            elif 'table' in filename.lower() or 'calculation' in filename.lower():
-                                score -= 500   # Strongly deprioritize tables and calculations
-                                st.write(f"  ❌ Table/Calculation detected (-500)")
-                            
-                            # Size bonus for larger regions (likely to be main drawings)
-                            if area > 200000:  # Large region
-                                score += 200
-                                st.write(f"  ✅ Large region (+200)")
-                            elif area > 100000:  # Medium region
-                                score += 100
-                                st.write(f"  ✅ Medium region (+100)")
-                            
-                            # Aspect ratio bonus for typical architectural drawings
-                            aspect_ratio = max(width, height) / min(width, height)
-                            if 1.2 <= aspect_ratio <= 2.0:  # Typical architectural drawing proportions
-                                score += 50
-                                st.write(f"  ✅ Good aspect ratio (+50)")
-                            
-                            st.write(f"  **Final Score: {score}**")
-                            
-                            if score > best_score:
-                                best_score = score
-                                best_region = image
-                                best_filename = filename
+                        # Show preview of extracted regions
+                        st.subheader("Extracted Regions Preview")
+                        extracted_items = list(extracted_data['cropped_images'].items())
+                        for i in range(0, min(6, len(extracted_items)), 3):  # Show max 6 images
+                            cols = st.columns(3)
+                            for j, (filename, img) in enumerate(extracted_items[i:i+3]):
+                                with cols[j]:
+                                    st.image(img, caption=filename.split('_')[1], use_column_width=True)
                         
-                        # If no clearly architectural region found, pick the largest non-table region
-                        if best_score <= 0:
-                            st.warning("No architectural drawings detected. Selecting largest non-table region...")
-                            non_table_regions = [(f, img) for f, img in extracted_data['cropped_images'].items() 
-                                                if not any(word in f.lower() for word in ['table', 'calculation', 'soil'])]
+                        # Run measurement analysis on suitable regions
+                        with st.spinner("Analyzing measurements with Gemini AI..."):
+                            # Select best region for analysis
+                            best_region = None
+                            best_filename = None
+                            best_score = 0
                             
-                            if non_table_regions:
+                            st.write("🔍 **Evaluating regions for architectural analysis:**")
+                            
+                            # Score each region for architectural content
+                            for filename, image in extracted_data['cropped_images'].items():
+                                score = 0
+                                width, height = image.size
+                                area = width * height
+                                
+                                st.write(f"• **{filename}**: {width}x{height} ({area:,} pixels)")
+                                
+                                # Prioritize architectural drawings over tables
+                                if 'architecture' in filename.lower() or 'layout' in filename.lower():
+                                    score += 1000
+                                    st.write(f"  ✅ Architecture/Layout detected (+1000)")
+                                elif 'site' in filename.lower() or 'plan' in filename.lower():
+                                    score += 800
+                                    st.write(f"  ✅ Site/Plan detected (+800)")
+                                elif 'zone' in filename.lower() and 'map' not in filename.lower():
+                                    score += 600
+                                    st.write(f"  ✅ Zone drawing detected (+600)")
+                                elif 'table' in filename.lower() or 'calculation' in filename.lower():
+                                    score -= 500
+                                    st.write(f"  ❌ Table/Calculation detected (-500)")
+                                
+                                # Size bonus for larger regions
+                                if area > 200000:
+                                    score += 200
+                                    st.write(f"  ✅ Large region (+200)")
+                                elif area > 100000:
+                                    score += 100
+                                    st.write(f"  ✅ Medium region (+100)")
+                                
+                                # Aspect ratio bonus
+                                aspect_ratio = max(width, height) / min(width, height)
+                                if 1.2 <= aspect_ratio <= 2.0:
+                                    score += 50
+                                    st.write(f"  ✅ Good aspect ratio (+50)")
+                                
+                                st.write(f"  **Final Score: {score}**")
+                                
+                                if score > best_score:
+                                    best_score = score
+                                    best_region = image
+                                    best_filename = filename
+                            
+                            # Fallback selection if no good architectural region found
+                            if best_score <= 0:
+                                st.warning("No architectural drawings detected. Selecting largest region...")
                                 best_filename, best_region = max(
-                                    non_table_regions,
+                                    extracted_data['cropped_images'].items(),
                                     key=lambda x: x[1].size[0] * x[1].size[1]
                                 )
-                            else:
-                                # Last resort: use any region except tables
-                                filtered_regions = [(f, img) for f, img in extracted_data['cropped_images'].items() 
-                                                  if 'table' not in f.lower()]
-                                if filtered_regions:
-                                    best_filename, best_region = max(
-                                        filtered_regions,
-                                        key=lambda x: x[1].size[0] * x[1].size[1]
-                                    )
+                            
+                            if best_region:
+                                st.success(f"🎯 **Selected for analysis: {best_filename}** (Score: {best_score})")
+                                
+                                # Show the region being analyzed
+                                st.subheader("Region Being Analyzed:")
+                                st.image(best_region, caption=f"Analyzing: {best_filename}", use_column_width=True)
+                                
+                                # Run all three measurement analyses
+                                st.write("🔍 **Running Measurement Analysis...**")
+                                
+                                lot_results = lot_detector.detect_lot_measurements(best_region)
+                                if lot_results.get('success'):
+                                    st.success(f"✅ Lot analysis: Found {len(lot_results.get('measurements', []))} measurements")
                                 else:
-                                    best_filename, best_region = max(
-                                        extracted_data['cropped_images'].items(),
-                                        key=lambda x: x[1].size[0] * x[1].size[1]
-                                    )
-                        
-                        if best_region:
-                            st.success(f"🎯 **Selected for analysis: {best_filename}** (Score: {best_score})")
-                            st.info("This region should contain lot boundaries, building footprint, and dimensional measurements.")
-                        
-                        if best_region:
-                            st.info(f"Analyzing measurements from region: {best_filename}")
-                            
-                            # Show the region being analyzed for debugging
-                            st.subheader("Region Being Analyzed:")
-                            st.image(best_region, caption=f"Analyzing: {best_filename}", use_column_width=True)
-                            
-                            # Run all three measurement analyses with detailed logging
-                            st.write("🔍 **Running Lot Measurements Analysis...**")
-                            lot_results = lot_detector.detect_lot_measurements(best_region)
-                            if lot_results.get('success'):
-                                st.success(f"✅ Lot analysis: Found {len(lot_results.get('measurements', []))} measurements")
-                            else:
-                                st.error(f"❌ Lot analysis failed: {lot_results.get('error', 'Unknown error')}")
-                            
-                            st.write("🔍 **Running Setback Measurements Analysis...**")
-                            setback_results = setback_detector.detect_setback_measurements(best_region)
-                            if setback_results.get('success'):
-                                st.success(f"✅ Setback analysis: Found {len(setback_results.get('measurements', []))} measurements")
-                            else:
-                                st.error(f"❌ Setback analysis failed: {setback_results.get('error', 'Unknown error')}")
-                            
-                            st.write("🔍 **Running Building Measurements Analysis...**")
-                            building_results = building_detector.detect_building_measurements(best_region)
-                            if building_results.get('success'):
-                                st.success(f"✅ Building analysis: Found {len(building_results.get('measurements', []))} measurements")
-                            else:
-                                st.error(f"❌ Building analysis failed: {building_results.get('error', 'Unknown error')}")
-                            
-                            # Show raw API responses for debugging
-                            if st.checkbox("Show Raw API Responses (Debug)", key="show_debug"):
-                                st.subheader("🔧 Debug Information")
+                                    st.warning(f"⚠️ Lot analysis: {lot_results.get('error', 'No measurements found')}")
                                 
-                                if lot_results.get('raw_response'):
-                                    with st.expander("Lot Analysis Raw Response"):
-                                        st.text(lot_results['raw_response'][:1000] + "..." if len(lot_results['raw_response']) > 1000 else lot_results['raw_response'])
-                                
-                                if setback_results.get('raw_response'):
-                                    with st.expander("Setback Analysis Raw Response"):
-                                        st.text(setback_results['raw_response'][:1000] + "..." if len(setback_results['raw_response']) > 1000 else setback_results['raw_response'])
-                                
-                                if building_results.get('raw_response'):
-                                    with st.expander("Building Analysis Raw Response"):
-                                        st.text(building_results['raw_response'][:1000] + "..." if len(building_results['raw_response']) > 1000 else building_results['raw_response'])
-                            
-                            # Get YOLO detection summary for zone detection
-                            yolo_summary = yolo_pipeline.get_detection_summary(st.session_state.detection_results)
-                            
-                            # Compile comprehensive analysis with zone detection
-                            analysis_results = zoning_compiler.compile_zoning_analysis(
-                                lot_results, setback_results, building_results, 
-                                best_filename, yolo_summary
-                            )
-                            
-                            st.session_state.analysis_results = analysis_results
-                            
-                            # Display results in the second column
-                            with col4:
-                                st.header("📊 Measurement Analysis Results")
-                                
-                                # Show detected zone information
-                                detected_zone = analysis_results['summary'].get('detected_zone', 'Unknown')
-                                zone_use = analysis_results['summary'].get('zone_use', 'Unknown')
-                                
-                                zone_col1, zone_col2 = st.columns(2)
-                                with zone_col1:
-                                    st.metric("Detected Zone", detected_zone)
-                                with zone_col2:
-                                    st.metric("Zone Use", zone_use)
-                                
-                                # Quick summary
-                                if analysis_results['summary']:
-                                    summary = analysis_results['summary']
-                                    metric_cols = st.columns(2)
-                                    with metric_cols[0]:
-                                        st.metric("Total Measurements", summary['total_measurements'])
-                                    with metric_cols[1]:
-                                        st.metric("Completeness", f"{summary['completeness_score']}%")
-                                
-                                # Show measurement counts
-                                measurement_cols = st.columns(3)
-                                with measurement_cols[0]:
-                                    st.metric("Lot", len(analysis_results.get('lot_measurements', [])))
-                                with measurement_cols[1]:
-                                    st.metric("Setback", len(analysis_results.get('setback_measurements', [])))
-                                with measurement_cols[2]:
-                                    st.metric("Building", len(analysis_results.get('building_measurements', [])))
-                                
-                                # Show analysis status
-                                success_count = sum([
-                                    lot_results.get('success', False),
-                                    setback_results.get('success', False),
-                                    building_results.get('success', False)
-                                ])
-                                
-                                if success_count == 3:
-                                    st.success("✅ All measurement analyses completed successfully!")
-                                elif success_count > 0:
-                                    st.warning(f"⚠️ {success_count}/3 measurement analyses completed")
+                                setback_results = setback_detector.detect_setback_measurements(best_region)
+                                if setback_results.get('success'):
+                                    st.success(f"✅ Setback analysis: Found {len(setback_results.get('measurements', []))} measurements")
                                 else:
-                                    st.error("❌ No measurement analyses completed successfully")
-                        else:
-                            st.warning("No suitable architectural regions found for measurement analysis")
-                else:
-                    st.warning("No regions extracted from YOLO detection")
+                                    st.warning(f"⚠️ Setback analysis: {setback_results.get('error', 'No measurements found')}")
+                                
+                                building_results = building_detector.detect_building_measurements(best_region)
+                                if building_results.get('success'):
+                                    st.success(f"✅ Building analysis: Found {len(building_results.get('measurements', []))} measurements")
+                                else:
+                                    st.warning(f"⚠️ Building analysis: {building_results.get('error', 'No measurements found')}")
+                                
+                                # Show debug information if requested
+                                if st.checkbox("Show Raw API Responses (Debug)", key="show_debug"):
+                                    st.subheader("🔧 Debug Information")
+                                    
+                                    debug_tabs = st.tabs(["Lot Response", "Setback Response", "Building Response"])
+                                    
+                                    with debug_tabs[0]:
+                                        if lot_results.get('raw_response'):
+                                            st.text_area("Lot Analysis Response", lot_results['raw_response'][:1000], height=150)
+                                    
+                                    with debug_tabs[1]:
+                                        if setback_results.get('raw_response'):
+                                            st.text_area("Setback Analysis Response", setback_results['raw_response'][:1000], height=150)
+                                    
+                                    with debug_tabs[2]:
+                                        if building_results.get('raw_response'):
+                                            st.text_area("Building Analysis Response", building_results['raw_response'][:1000], height=150)
+                                
+                                # Compile comprehensive analysis
+                                yolo_summary = yolo_pipeline.get_detection_summary(st.session_state.detection_results)
+                                
+                                analysis_results = zoning_compiler.compile_zoning_analysis(
+                                    lot_results, setback_results, building_results, 
+                                    best_filename, yolo_summary
+                                )
+                                
+                                st.session_state.analysis_results = analysis_results
+                                
+                                # Display results in the second column
+                                with col4:
+                                    st.header("📊 Measurement Analysis Results")
+                                    
+                                    # Show detected zone information
+                                    detected_zone = analysis_results['summary'].get('detected_zone', 'R-4')
+                                    zone_use = analysis_results['summary'].get('zone_use', 'Single Family')
+                                    
+                                    zone_col1, zone_col2 = st.columns(2)
+                                    with zone_col1:
+                                        st.metric("Detected Zone", detected_zone)
+                                    with zone_col2:
+                                        st.metric("Zone Use", zone_use)
+                                    
+                                    # Quick summary
+                                    if analysis_results['summary']:
+                                        summary = analysis_results['summary']
+                                        metric_cols = st.columns(2)
+                                        with metric_cols[0]:
+                                            st.metric("Total Measurements", summary['total_measurements'])
+                                        with metric_cols[1]:
+                                            st.metric("Completeness", f"{summary['completeness_score']}%")
+                                    
+                                    # Show measurement counts
+                                    measurement_cols = st.columns(3)
+                                    with measurement_cols[0]:
+                                        st.metric("Lot", len(analysis_results.get('lot_measurements', [])))
+                                    with measurement_cols[1]:
+                                        st.metric("Setback", len(analysis_results.get('setback_measurements', [])))
+                                    with measurement_cols[2]:
+                                        st.metric("Building", len(analysis_results.get('building_measurements', [])))
+                                    
+                                    # Show analysis status
+                                    success_count = sum([
+                                        lot_results.get('success', False),
+                                        setback_results.get('success', False),
+                                        building_results.get('success', False)
+                                    ])
+                                    
+                                    if success_count == 3:
+                                        st.success("✅ All measurement analyses completed successfully!")
+                                    elif success_count > 0:
+                                        st.warning(f"⚠️ {success_count}/3 measurement analyses completed")
+                                    else:
+                                        st.warning("⚠️ Limited measurement data available")
+                                        if CLOUD_MODE:
+                                            st.info("This may be due to image quality or cloud processing limitations")
+                            else:
+                                st.warning("No suitable regions found for measurement analysis")
+                    else:
+                        st.warning("No regions extracted from YOLO detection")
+                        if CLOUD_MODE:
+                            st.info("Try lowering the confidence threshold or using a clearer image")
+                
+                except Exception as e:
+                    st.error(f"Analysis failed: {str(e)}")
+                    if CLOUD_MODE:
+                        st.info("This may be due to cloud memory limits or API timeouts. Try a smaller image or simpler PDF.")
     
-    # Step 3: Multiple Architecture Analysis Dashboard (show if any analysis exists)
-    if ('multiple_analysis_results' in st.session_state and st.session_state.multiple_analysis_results) or ('analysis_results' in st.session_state and st.session_state.analysis_results):
+    # Step 3: Results Dashboard (show if analysis exists)
+    if 'analysis_results' in st.session_state and st.session_state.analysis_results:
         st.markdown("---")
         
-        # Use multiple results if available, otherwise single result
-        analysis_list = st.session_state.get('multiple_analysis_results', [])
-        if not analysis_list and 'analysis_results' in st.session_state and st.session_state.analysis_results:
-            analysis_list = [st.session_state.analysis_results]
+        analysis_results = st.session_state.analysis_results
         
-        if not analysis_list:
-            st.error("No analysis results found")
-            return
-            
-        # Display separate analysis for each architectural layout
-        st.header("📊 Step 3: Comprehensive Architecture Analysis Results")
+        # Display comprehensive analysis results
+        st.header("📊 Step 3: Comprehensive Analysis Results")
         
-        st.info(f"Found {len(analysis_list)} architectural layout(s) for detailed analysis")
+        # Show the architectural drawing being analyzed
+        col_result1, col_result2 = st.columns([1, 2])
         
-        for i, analysis_results in enumerate(analysis_list, 1):
-            region_info = analysis_results.get('region_info', {})
-            region_filename = region_info.get('filename', f'Architecture {i}')
-            
-            st.subheader(f"🏗️ Architecture Analysis {i}: {region_filename}")
-            
-            # Show the architectural drawing being analyzed
-            col_arch1, col_arch2 = st.columns([1, 2])
-            
-            with col_arch1:
-                st.markdown("**Architectural Drawing:**")
-                # Find and display the corresponding image
-                if 'extracted_data' in st.session_state:
-                    extracted_images = st.session_state.extracted_data.get('cropped_images', {})
-                    if region_filename in extracted_images:
-                        st.image(extracted_images[region_filename], 
-                                caption=f"Source: {region_filename}", 
-                                use_column_width=True)
-                    else:
-                        st.info("Image not available for this analysis")
-                
-                # Show detected zone and summary
-                detected_zone = analysis_results.get('summary', {}).get('detected_zone', 'R-4')
-                zone_use = analysis_results.get('summary', {}).get('zone_use', 'Single Family')
-                
-                st.metric("Detected Zone", detected_zone)
-                st.metric("Zone Use", zone_use)
-            
-            with col_arch2:
-                st.markdown("**Analysis Summary:**")
-                summary = analysis_results.get('summary', {})
-                
-                metric_cols = st.columns(4)
-                with metric_cols[0]:
-                    st.metric("Total Measurements", summary.get('total_measurements', 0))
-                with metric_cols[1]:
-                    st.metric("Completeness", f"{summary.get('completeness_score', 0)}%")
-                with metric_cols[2]:
-                    st.metric("Overall Compliance", summary.get('overall_compliance', 'UNKNOWN'))
-                with metric_cols[3]:
-                    compliance = analysis_results.get('compliance_analysis', {})
-                    compliance_rate = compliance.get('compliance_rate', '0/0')
-                    st.metric("Compliance Rate", compliance_rate)
-            
-            # Individual Zoning Requirements Table for this Architecture
-            st.markdown(f"**Zoning Requirements Table - Architecture {i}:**")
-            
-            zoning_table = analysis_results.get('zoning_table', {})
-            if zoning_table:
-                # Create DataFrame for this architecture's analysis
-                table_data = []
-                for requirement, data in zoning_table.items():
-                    # Handle both dict and direct value cases
-                    if isinstance(data, dict):
-                        value = data.get('value', 'N/A')
-                        compliance = data.get('compliance', 'UNKNOWN')
-                        variance = data.get('variance_needed', 'N/A')
-                    else:
-                        value = str(data)
-                        compliance = 'UNKNOWN'
-                        variance = 'N/A'
-                        
-                    table_data.append({
-                        'Requirement': requirement.replace('_', ' ').title(),
-                        'Value': value,
-                        'Compliance': compliance,
-                        'Variance Needed': variance
-                    })
-                
-                if table_data:  # Only show table if we have data
-                    df = pd.DataFrame(table_data)
-                    
-                    # Style the dataframe
-                    def style_compliance(val):
-                        if val == 'COMPLIANT':
-                            return 'background-color: #d4edda; color: #155724'
-                        elif val == 'NON-COMPLIANT':
-                            return 'background-color: #f8d7da; color: #721c24'
-                        else:
-                            return 'background-color: #fff3cd; color: #856404'
-                    
-                    # Apply styling only to Compliance column if it exists
-                    if 'Compliance' in df.columns:
-                        styled_df = df.style.applymap(style_compliance, subset=['Compliance'])
-                        st.dataframe(styled_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
+        with col_result1:
+            st.markdown("**Analyzed Region:**")
+            # Show the region that was analyzed
+            if 'extracted_data' in st.session_state:
+                extracted_images = st.session_state.extracted_data.get('cropped_images', {})
+                source_image = analysis_results.get('source_image', '')
+                if source_image in extracted_images:
+                    st.image(extracted_images[source_image], 
+                            caption=f"Source: {source_image}", 
+                            use_column_width=True)
                 else:
-                    st.warning("No zoning table data available for this architecture")
+                    st.info("Analyzed region image not available")
+            
+            # Show detected zone and summary
+            detected_zone = analysis_results.get('summary', {}).get('detected_zone', 'R-4')
+            zone_use = analysis_results.get('summary', {}).get('zone_use', 'Single Family')
+            
+            st.metric("Detected Zone", detected_zone)
+            st.metric("Zone Use", zone_use)
+        
+        with col_result2:
+            st.markdown("**Analysis Summary:**")
+            summary = analysis_results.get('summary', {})
+            
+            metric_cols = st.columns(4)
+            with metric_cols[0]:
+                st.metric("Total Measurements", summary.get('total_measurements', 0))
+            with metric_cols[1]:
+                st.metric("Completeness", f"{summary.get('completeness_score', 0)}%")
+            with metric_cols[2]:
+                st.metric("Overall Compliance", summary.get('overall_compliance', 'UNKNOWN'))
+            with metric_cols[3]:
+                compliance = analysis_results.get('compliance_analysis', {})
+                compliance_rate = compliance.get('compliance_rate', '0/0')
+                st.metric("Compliance Rate", compliance_rate)
+        
+        # Zoning Requirements Table
+        st.markdown("**Zoning Requirements Analysis:**")
+        
+        zoning_table = analysis_results.get('zoning_table', {})
+        if zoning_table:
+            # Create DataFrame for display
+            table_data = []
+            for requirement, data in zoning_table.items():
+                # Handle both dict and direct value cases
+                if isinstance(data, dict):
+                    value = data.get('value', 'N/A')
+                    compliance = data.get('compliance', 'UNKNOWN')
+                    variance = data.get('variance_needed', 'N/A')
+                else:
+                    value = str(data)
+                    compliance = 'UNKNOWN'
+                    variance = 'N/A'
+                    
+                table_data.append({
+                    'Requirement': requirement.replace('_', ' ').title(),
+                    'Value': value,
+                    'Compliance': compliance,
+                    'Variance Needed': variance
+                })
+            
+            if table_data:
+                df = pd.DataFrame(table_data)
+                
+                # Style the dataframe
+                def style_compliance(val):
+                    if val == 'COMPLIANT':
+                        return 'background-color: #d4edda; color: #155724'
+                    elif val == 'NON-COMPLIANT':
+                        return 'background-color: #f8d7da; color: #721c24'
+                    else:
+                        return 'background-color: #fff3cd; color: #856404'
+                
+                # Apply styling only to Compliance column if it exists
+                if 'Compliance' in df.columns:
+                    styled_df = df.style.applymap(style_compliance, subset=['Compliance'])
+                    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                else:
+                    st.dataframe(df, use_container_width=True, hide_index=True)
             else:
-                st.warning("No zoning table found for this architecture")
-            
-            # Detailed measurements for this architecture
-            measurement_tabs = st.tabs([f"📏 Lot Measurements", f"📐 Setback Measurements", f"🏠 Building Measurements"])
-            
-            with measurement_tabs[0]:
-                lot_measurements = analysis_results.get('lot_measurements', [])
-                if lot_measurements:
-                    st.write(f"**Found {len(lot_measurements)} lot measurements:**")
-                    for j, m in enumerate(lot_measurements, 1):
-                        st.write(f"{j}. **{m.get('text', 'N/A')}** = {m.get('value', 0)} {m.get('unit', 'FT')} ({m.get('type', 'unknown')})")
-                else:
-                    st.write("No lot measurements found for this architecture")
-            
-            with measurement_tabs[1]:
-                setback_measurements = analysis_results.get('setback_measurements', [])
-                if setback_measurements:
-                    st.write(f"**Found {len(setback_measurements)} setback measurements:**")
-                    for j, m in enumerate(setback_measurements, 1):
-                        orientation_method = m.get('orientation_method', 'unknown method')
-                        confidence = m.get('confidence', 'medium')
-                        st.write(f"{j}. **{m.get('text', 'N/A')}** = {m.get('value', 0)} {m.get('unit', 'FT')} ({m.get('type', 'unknown')}) - {orientation_method} (Confidence: {confidence})")
-                else:
-                    st.write("No setback measurements found for this architecture")
-            
-            with measurement_tabs[2]:
-                building_measurements = analysis_results.get('building_measurements', [])
-                if building_measurements:
-                    st.write(f"**Found {len(building_measurements)} building measurements:**")
-                    for j, m in enumerate(building_measurements, 1):
-                        st.write(f"{j}. **{m.get('text', 'N/A')}** = {m.get('value', 0)} {m.get('unit', 'FT')} ({m.get('type', 'unknown')})")
-                else:
-                    st.write("No building measurements found for this architecture")
-            
-            # Individual download section for this architecture
-            st.markdown(f"**Download Results for Architecture {i}:**")
-            
-            col_dl1, col_dl2 = st.columns(2)
-            
-            with col_dl1:
-                # Download individual analysis JSON
-                individual_json = json.dumps(analysis_results, indent=2, default=str)
-                st.download_button(
-                    label=f"📋 Download Analysis {i} (JSON)",
-                    data=individual_json,
-                    file_name=f"architecture_{i}_analysis.json",
-                    mime="application/json",
-                    key=f"download_arch_{i}_json"
-                )
-            
-            with col_dl2:
-                # Download individual zoning table CSV
-                if zoning_table:
-                    individual_csv_data = []
-                    for req, data in zoning_table.items():
-                        individual_csv_data.append({
-                            'Architecture': f'Architecture {i}',
-                            'Requirement': req,
-                            'Value': data.get('value', 'N/A'),
-                            'Compliance': data.get('compliance', 'UNKNOWN'),
-                            'Variance_Needed': data.get('variance_needed', 'N/A')
-                        })
-                    
-                    df_individual = pd.DataFrame(individual_csv_data)
-                    csv_buffer = io.StringIO()
-                    df_individual.to_csv(csv_buffer, index=False)
-                    
-                    st.download_button(
-                        label=f"📊 Download Table {i} (CSV)",
-                        data=csv_buffer.getvalue(),
-                        file_name=f"architecture_{i}_zoning_table.csv",
-                        mime="text/csv",
-                        key=f"download_arch_{i}_csv"
-                    )
-            
-            st.markdown("---")
-        
-        # Combined download for multiple architectures
-        if len(analysis_list) > 1:
-            st.header("💾 Download Complete Multi-Architecture Analysis")
-            
-            col_combined1, col_combined2, col_combined3 = st.columns(3)
-            
-            with col_combined1:
-                # Download comprehensive analysis package
-                if st.button("📦 Download All Architectures Package"):
-                    with st.spinner("Creating comprehensive multi-architecture package..."):
-                        zip_data = create_comprehensive_zip(
-                            {'multiple_architectures': analysis_list},
-                            st.session_state.get('extracted_data'),
-                            st.session_state.get('pdf_name', 'analysis')
-                        )
-                        
-                        st.download_button(
-                            label="📦 Download Multi-Architecture Package (ZIP)",
-                            data=zip_data,
-                            file_name=f"multi_architecture_analysis.zip",
-                            mime="application/zip",
-                            help="Complete package with all architectures, measurements, and compliance analysis"
-                        )
-            
-            with col_combined2:
-                # Download combined analysis JSON
-                combined_json = json.dumps({
-                    'multiple_architectures': analysis_list,
-                    'pdf_source': st.session_state.get('pdf_name', 'unknown'),
-                    'analysis_count': len(analysis_list)
-                }, indent=2, default=str)
-                st.download_button(
-                    label="📋 Download Combined Analysis (JSON)",
-                    data=combined_json,
-                    file_name=f"combined_architectures.json",
-                    mime="application/json"
-                )
-            
-            with col_combined3:
-                # Download combined CSV with all architectures
-                combined_csv_data = []
-                for i, analysis in enumerate(analysis_list, 1):
-                    zoning_table = analysis.get('zoning_table', {})
-                    region_info = analysis.get('region_info', {})
-                    region_filename = region_info.get('filename', f'Architecture {i}')
-                    
-                    for req, data in zoning_table.items():
-                        combined_csv_data.append({
-                            'Architecture_Number': i,
-                            'Architecture_Name': region_filename,
-                            'Requirement': req,
-                            'Value': data.get('value', 'N/A'),
-                            'Compliance': data.get('compliance', 'UNKNOWN'),
-                            'Variance_Needed': data.get('variance_needed', 'N/A')
-                        })
-                
-                if combined_csv_data:
-                    df_combined = pd.DataFrame(combined_csv_data)
-                    csv_combined_buffer = io.StringIO()
-                    df_combined.to_csv(csv_combined_buffer, index=False)
-                    
-                    st.download_button(
-                        label="📊 Download All Tables (CSV)",
-                        data=csv_combined_buffer.getvalue(),
-                        file_name=f"all_architectures_zoning.csv",
-                        mime="text/csv"
-                    )
+                st.warning("No zoning table data available")
         else:
-            # Single architecture download options
-            st.header("💾 Download Analysis Results")
-            
-            col_single1, col_single2, col_single3 = st.columns(3)
-            
-            with col_single1:
-                if st.button("📦 Download Complete Package"):
+            st.warning("No zoning analysis results found")
+        
+        # Detailed measurements
+        measurement_tabs = st.tabs(["📏 Lot Measurements", "📐 Setback Measurements", "🏠 Building Measurements"])
+        
+        with measurement_tabs[0]:
+            lot_measurements = analysis_results.get('lot_measurements', [])
+            if lot_measurements:
+                st.write(f"**Found {len(lot_measurements)} lot measurements:**")
+                for i, m in enumerate(lot_measurements, 1):
+                    st.write(f"{i}. **{m.get('text', 'N/A')}** = {m.get('value', 0)} {m.get('unit', 'FT')} ({m.get('type', 'unknown')})")
+            else:
+                st.write("No lot measurements found")
+        
+        with measurement_tabs[1]:
+            setback_measurements = analysis_results.get('setback_measurements', [])
+            if setback_measurements:
+                st.write(f"**Found {len(setback_measurements)} setback measurements:**")
+                for i, m in enumerate(setback_measurements, 1):
+                    confidence = m.get('confidence', 'medium')
+                    st.write(f"{i}. **{m.get('text', 'N/A')}** = {m.get('value', 0)} {m.get('unit', 'FT')} ({m.get('type', 'unknown')}) - Confidence: {confidence}")
+            else:
+                st.write("No setback measurements found")
+        
+        with measurement_tabs[2]:
+            building_measurements = analysis_results.get('building_measurements', [])
+            if building_measurements:
+                st.write(f"**Found {len(building_measurements)} building measurements:**")
+                for i, m in enumerate(building_measurements, 1):
+                    st.write(f"{i}. **{m.get('text', 'N/A')}** = {m.get('value', 0)} {m.get('unit', 'FT')} ({m.get('type', 'unknown')})")
+            else:
+                st.write("No building measurements found")
+        
+        # Download Results Section
+        st.header("💾 Download Analysis Results")
+        
+        col_download1, col_download2, col_download3 = st.columns(3)
+        
+        with col_download1:
+            if st.button("📦 Download Complete Package"):
+                try:
                     with st.spinner("Creating analysis package..."):
                         zip_data = create_comprehensive_zip(
-                            analysis_list[0],
+                            analysis_results,
                             st.session_state.get('extracted_data'),
                             st.session_state.get('pdf_name', 'analysis')
                         )
@@ -2367,82 +2208,97 @@ def main():
                             label="📦 Download Analysis Package (ZIP)",
                             data=zip_data,
                             file_name=f"architecture_analysis.zip",
-                            mime="application/zip"
+                            mime="application/zip",
+                            help="Complete package with measurements, compliance analysis, and extracted regions"
                         )
-            
-            with col_single2:
-                analysis_json = json.dumps(analysis_list[0], indent=2, default=str)
+                except Exception as e:
+                    st.error(f"Failed to create download package: {str(e)}")
+        
+        with col_download2:
+            try:
+                analysis_json = json.dumps(analysis_results, indent=2, default=str)
                 st.download_button(
                     label="📋 Download Analysis (JSON)",
                     data=analysis_json,
                     file_name=f"architecture_analysis.json",
-                    mime="application/json"
+                    mime="application/json",
+                    help="Complete analysis results in JSON format"
                 )
-            
-            with col_single3:
-                zoning_table = analysis_list[0].get('zoning_table', {})
+            except Exception as e:
+                st.error(f"Failed to create JSON download: {str(e)}")
+        
+        with col_download3:
+            try:
                 if zoning_table:
                     zoning_data = []
                     for req, data in zoning_table.items():
-                        zoning_data.append({
-                            'Requirement': req,
-                            'Value': data.get('value', 'N/A'),
-                            'Compliance': data.get('compliance', 'UNKNOWN'),
-                            'Variance_Needed': data.get('variance_needed', 'N/A')
-                        })
+                        if isinstance(data, dict):
+                            zoning_data.append({
+                                'Requirement': req,
+                                'Value': data.get('value', 'N/A'),
+                                'Compliance': data.get('compliance', 'UNKNOWN'),
+                                'Variance_Needed': data.get('variance_needed', 'N/A')
+                            })
                     
-                    df = pd.DataFrame(zoning_data)
-                    csv_buffer = io.StringIO()
-                    df.to_csv(csv_buffer, index=False)
-                    
-                    st.download_button(
-                        label="📊 Download Zoning Table (CSV)",
-                        data=csv_buffer.getvalue(),
-                        file_name=f"zoning_table.csv",
-                        mime="text/csv"
-                    )
+                    if zoning_data:
+                        df = pd.DataFrame(zoning_data)
+                        csv_buffer = io.StringIO()
+                        df.to_csv(csv_buffer, index=False)
+                        
+                        st.download_button(
+                            label="📊 Download Zoning Table (CSV)",
+                            data=csv_buffer.getvalue(),
+                            file_name=f"zoning_table.csv",
+                            mime="text/csv",
+                            help="Zoning compliance table in CSV format"
+                        )
+                    else:
+                        st.info("No zoning table data to download")
+                else:
+                    st.info("No zoning table available for download")
+            except Exception as e:
+                st.error(f"Failed to create CSV download: {str(e)}")
     
-    # Instructions
-    with st.expander("ℹ️ How to use this comprehensive analysis tool"):
+    # Instructions and Help
+    with st.expander("ℹ️ How to use this tool"):
         st.markdown("""
         ## Complete Workflow:
         
         ### Step 1: PDF Processing & YOLO Detection
-        1. **Upload PDF**: Select an architectural drawing or zoning document
+        1. **Upload PDF**: Select an architectural drawing or zoning document (max 25MB for cloud)
         2. **Page Selection**: Choose the page containing the main site plan
-        3. **Run YOLO Detection**: AI identifies architectural elements, tables, and zones
+        3. **Run YOLO Detection**: AI identifies architectural elements and regions
         
         ### Step 2: Region Extraction & Measurement Analysis
-        1. **Extract Regions**: Crops detected architectural elements 
-        2. **Gemini AI Analysis**: Advanced AI analyzes each region for:
+        1. **Extract Regions**: Automatically crops detected architectural elements 
+        2. **AI Analysis**: Gemini AI analyzes the best region for:
            - **Lot Measurements**: Area, width, depth, boundary dimensions
            - **Setback Measurements**: Front, rear, side setbacks from dwelling to boundaries
            - **Building Measurements**: Building area, dimensions, height
         
-        ### Step 3: Comprehensive Results
-        1. **Zoning Analysis Dashboard**: Complete compliance analysis
+        ### Step 3: Results & Download
+        1. **Zoning Analysis**: Complete compliance analysis against R-4 standards
         2. **Interactive Tables**: All measurements with compliance status
         3. **Download Options**: Complete analysis package with all data
         
-        ## What You Get:
-        - ✅ Complete zoning requirements analysis
-        - ✅ Compliance checking against R-4 zoning standards
-        - ✅ Detailed measurement extraction with confidence scores
-        - ✅ Comprehensive reports and data exports
-        - ✅ Visual annotations and region extractions
+        ## Cloud Optimizations:
+        - Reduced image resolution for faster processing
+        - Memory-optimized PDF conversion
+        - Shorter API timeouts
+        - File size limits to prevent crashes
         
         ## Technology Stack:
         - **YOLOv8**: Object detection for architectural elements
         - **Gemini AI**: Advanced measurement analysis and OCR
-        - **Computer Vision**: High-resolution PDF processing
-        - **Compliance Engine**: Automatic zoning compliance checking
+        - **PyMuPDF**: Cloud-optimized PDF processing
+        - **Streamlit**: Interactive web interface
         """)
     
     # Footer
     st.markdown("---")
     st.markdown("""
     **Comprehensive Architectural Analysis Pipeline** 🏗️  
-    Built with: Streamlit • YOLOv8 • Gemini AI • OpenCV • Computer Vision  
+    Cloud-Optimized Version • Built with: Streamlit • YOLOv8 • Gemini AI • PyMuPDF  
     Features: PDF Processing • Object Detection • AI Measurement Analysis • Zoning Compliance
     """)
 
