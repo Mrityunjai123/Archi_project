@@ -241,8 +241,8 @@ class YOLOv8Pipeline:
     def __init__(self, model_path=None):
         # Multiple model path options for different deployments
         possible_paths = [
-            "model/custom_yolov8_final.pt",     # GitHub structure
-            "models/custom_yolov8_final.pt",    # Alternative structure
+            "model/new_yolov8_final.pt",     # GitHub structure
+            "models/new_yolov8_final.pt",    # Alternative structure
             "custom_yolov8_final.pt",           # Root directory
         ] if model_path is None else [model_path]
         
