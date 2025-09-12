@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import cv2
 import numpy as np
@@ -559,49 +560,53 @@ class EnhancedLotMeasurementsDetector:
         except Exception as e:
             return {'success': False, 'error': f'Failed to encode image: {e}'}
         
+        # In EnhancedLotMeasurementsDetector.detect_lot_measurements()
         enhanced_lot_prompt = """
-ENHANCED LOT POLYGON MEASUREMENTS DETECTION
+CRITICAL LOT BOUNDARY MEASUREMENTS DETECTION
 
-CRITICAL: Find ALL lot boundary dimensions including labeled measurements with prefixes.
+IMPORTANT: ONLY detect measurements that define the PROPERTY BOUNDARIES, NOT building dimensions.
 
-METHOD 1 - EXPLICIT AREA LABELS:
-• "AREA = X SF" or "AREA = X SQ FT" 
-• "X SQUARE FEET" or "X SQ.FT."
-• "X ACRES" (convert: 1 acre = 43,560 SF)
+WHAT TO FIND:
+1. LOT AREA: "AREA = X SF", "X SQUARE FEET", "X ACRES"
+2. LOT BOUNDARY DIMENSIONS: Property perimeter measurements
+   - Street frontage dimensions
+   - Side property line dimensions  
+   - Rear property line dimensions
+   - Curved boundary measurements (radius, arc length)
 
-METHOD 2 - LABELED DIMENSION DETECTION (CRITICAL):
-• Look for measurements with prefixes: "L=", "B=", "W=", "D="
-• "L=77.00'" = Length/Width measurement
-• "B=125.0'" = Breadth/Depth measurement  
-• "R=300.00'" = Radius for curved boundaries
-• These are often lot boundary measurements
+WHAT TO IGNORE:
+- Building dimensions (these are NOT lot measurements)
+- Interior building measurements
+- Setback distances
+- Any dimension that measures building parts
 
-METHOD 3 - ALL POLYGON BOUNDARY DIMENSIONS:
-• Property boundaries form closed polygon around entire lot
-• Each side of polygon should have dimension measurement
-• Look for ALL boundary measurements (not just width/depth)
-• Include curved boundary measurements (radius, arc length)
-• Street boundaries, side boundaries, rear boundaries
+BOUNDARY IDENTIFICATION:
+- Look for measurements along the OUTER PERIMETER of the entire property
+- Property boundaries are usually shown as thick lines around the entire lot
+- May include bearings like "S 28°-02'-00" W" with distances
+- Street boundaries, side boundaries, rear boundaries
 
-Return JSON with ALL found measurements:
+CRITICAL: If a measurement is between 10-100 feet and appears to be measuring a building or structure, REJECT it as it's likely a building dimension, not a lot boundary.
+
+Return JSON with ONLY lot boundary measurements:
 [
   {
-    "text": "AREA=8,694 S.F.",
-    "value": 8694,
+    "text": "S 28°-02'-00" W 505.0'",
+    "value": 505.0,
+    "unit": "FT",
+    "type": "lot_boundary",
+    "method": "surveyor_bearing"
+  },
+  {
+    "text": "AREA=94,195 S.F.",
+    "value": 94195,
     "unit": "SF", 
     "type": "lot_area",
     "method": "explicit_label"
-  },
-  {
-    "text": "L=77.00'",
-    "value": 77.0,
-    "unit": "FT",
-    "type": "lot_width",
-    "method": "labeled_dimension"
   }
 ]
 
-PRIORITY: Find ALL polygon boundary dimensions, especially labeled ones (L=, B=, R=).
+REJECT building dimensions that are typically 15-50 feet - these are NOT lot measurements.
 """
         
         payload = {
@@ -1034,61 +1039,45 @@ class EnhancedBuildingMeasurementsDetector:
         except Exception as e:
             return {'success': False, 'error': f'Failed to encode image: {e}'}
         
+        # In EnhancedBuildingMeasurementsDetector.detect_building_measurements()
         enhanced_building_prompt = """
-ENHANCED BUILDING MEASUREMENTS DETECTION WITH COMPREHENSIVE POLYGON ANALYSIS
+BUILDING/DWELLING MEASUREMENTS DETECTION
 
-STEP 1: IDENTIFY DWELLING STRUCTURE (CRITICAL)
-• Find dwelling labels: "DWELLING", "HOUSE", "RESIDENCE", "BUILDING"
-• Look for: "1½ STORY DWELLING", "FRAME DWELLING", "MAIN DWELLING"
-• The dwelling is shown as a hatched/shaded polygon (cross-hatched pattern)
-• Distinguish from: "GARAGE", "SHED", "PORCH", "ACCESSORY BUILDING"
+CRITICAL: Find measurements that define the BUILDING STRUCTURE only.
 
-STEP 2: COMPREHENSIVE BUILDING POLYGON ANALYSIS
-• The dwelling polygon represents the building footprint
-• Look for ALL dimensions that measure parts of this polygon
-• Include main dimensions, wings, extensions, interior spaces
-• Building polygon is SEPARATE from lot boundaries
+STEP 1: IDENTIFY THE DWELLING
+- Look for building footprint (hatched/shaded area)
+- Labels: "DWELLING", "HOUSE", "RESIDENCE"
+- Distinguished from "GARAGE", "SHED", "PORCH"
 
-COMPREHENSIVE MEASUREMENTS TO FIND:
+STEP 2: FIND BUILDING MEASUREMENTS
+1. EXPLICIT BUILDING AREA:
+   • "BUILDING AREA = X SF"
+   • "FLOOR AREA = X SF"
+   • "FOOTPRINT = X SF"
 
-1. DWELLING AREA (HIGHEST PRIORITY):
-   METHOD A - Explicit Area Labels:
-   • "BUILDING AREA = X SF", "FLOOR AREA = X SF", "FOOTPRINT = X SF"
-   • "1,152 S.F. FOOTPRINT", "DWELLING AREA: X SF"
-   
-   METHOD B - Complete Dimensional Analysis:
-   • Find ALL building dimensions and calculate total area
+2. BUILDING DIMENSIONS:
+   • Exterior building width/length
+   • Overall building footprint dimensions
+   • Building height or stories
 
-2. ALL BUILDING DIMENSIONS (COMPREHENSIVE):
-   • Main exterior dimensions (overall width × length)
-   • Interior dimensions within building footprint  
-   • Wing/extension dimensions
-   • Component dimensions (porches, bays, additions)
-   • ANY measurement that defines part of the building structure
+3. AVOID:
+   • Lot boundary measurements
+   • Setback measurements
+   • Interior room dimensions
 
-3. DWELLING HEIGHT INFORMATION:
-   • Story information: "1-STORY", "2-STORY", "1½ STORY"
-   • Height measurements: "32 FT HEIGHT", "35' MAX HEIGHT"
-
-Return JSON with ALL building dimensions and calculated area:
+RETURN ONLY UNIQUE MEASUREMENTS:
 [
   {
-    "text": "26.63' (main building width)",
-    "value": 26.63,
-    "unit": "FT",
-    "type": "dwelling_width",
+    "text": "Building Area: 1,200 SF",
+    "value": 1200,
+    "unit": "SF",
+    "type": "dwelling_area",
     "component": "main_structure"
-  },
-  {
-    "text": "1½ STORY",
-    "value": 1.5,
-    "unit": "stories",
-    "type": "dwelling_height",
-    "component": "building_height"
   }
 ]
 
-MANDATORY: Find ALL building dimensions and calculate accurate total area.
+Do not duplicate measurements or create multiple area calculations.
 """
         
         payload = {
@@ -1919,34 +1908,50 @@ class ZoningTableCompiler:
         
         return summary
     
+    # In ZoningTableCompiler class, replace _process_setback_measurements
     def _process_setback_measurements(self, measurements):
         summary = {}
-        
-        setback_types = {
-            'front_setback': 'front',
-            'rear_setback': 'rear',
-            'left_side_setback': 'left_side',
-            'right_side_setback': 'right_side'
+    
+        # Group setbacks by type
+        setback_groups = {
+            'front_setback': [],
+            'rear_setback': [],
+            'side_setback': [],
+            'left_side_setback': [],
+            'right_side_setback': []
         }
-        
-        for m_type, key in setback_types.items():
-            setbacks = [m for m in measurements if m['type'] == m_type]
+    
+        for m in measurements:
+            setback_type = m['type']
+            if setback_type in setback_groups:
+                setback_groups[setback_type].append(m)
+            elif 'setback' in setback_type:
+                setback_groups['side_setback'].append(m)
+    
+        # Process each group
+        for group_name, setbacks in setback_groups.items():
             if setbacks:
-                summary[key] = setbacks[0]
-        
-        # Calculate minimum side and aggregate
-        sides = [summary.get('left_side'), summary.get('right_side')]
-        sides = [s for s in sides if s]
-        
-        if sides:
-            summary['min_side'] = min(sides, key=lambda x: x['value'])
-            if len(sides) == 2:
+                if group_name == 'front_setback':
+                    summary['front'] = setbacks[0]  # Take first front setback
+                elif group_name == 'rear_setback':
+                    summary['rear'] = setbacks[0]   # Take first rear setback
+                elif group_name in ['side_setback', 'left_side_setback', 'right_side_setback']:
+                    # Handle multiple side setbacks
+                    for i, setback in enumerate(setbacks):
+                        summary[f'side_{i+1}'] = setback
+    
+        # Calculate minimum side and aggregate from all side setbacks
+        all_sides = [v for k, v in summary.items() if k.startswith('side_')]
+        if all_sides:
+            summary['min_side'] = min(all_sides, key=lambda x: x['value'])
+            if len(all_sides) >= 2:
+                total_aggregate = sum(s['value'] for s in all_sides)
                 summary['aggregate'] = {
-                    'value': sum(s['value'] for s in sides),
+                    'value': total_aggregate,
                     'unit': 'FT',
-                    'text': f"Aggregate: {sides[0]['value']:.2f}' + {sides[1]['value']:.2f}'"
+                    'text': f"Total aggregate: {total_aggregate:.2f}'"
                 }
-        
+    
         return summary
     
     def _process_building_measurements(self, measurements):
