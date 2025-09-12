@@ -635,30 +635,48 @@ PRIORITY: Find ALL polygon boundary dimensions, especially labeled ones (L=, B=,
     
     def _extract_lot_measurements(self, response: str) -> List[Dict]:
         measurements = []
-        
+    
         try:
             json_start = response.find('[')
             json_end = response.rfind(']') + 1
             if json_start != -1 and json_end > json_start:
                 json_content = response[json_start:json_end]
                 raw_data = json.loads(json_content)
-                
+            
                 for item in raw_data:
-                    measurement = {
-                        'text': str(item.get('text', '')),
-                        'value': float(item.get('value', 0)),
-                        'unit': str(item.get('unit', 'FT')),
-                        'type': str(item.get('type', 'unknown')),
-                        'method': str(item.get('method', 'not_specified'))
-                    }
-                    if measurement['value'] > 0:
-                        measurements.append(measurement)
+                    # Add None checks for all values
+                    text_val = item.get('text', '')
+                    value_val = item.get('value')
+                    unit_val = item.get('unit', 'FT')
+                    type_val = item.get('type', 'unknown')
+                    method_val = item.get('method', 'not_specified')
                 
+                    # Skip if value is None or not convertible to float
+                    if value_val is None:
+                        continue
+                
+                    try:
+                        value_float = float(value_val)
+                        if value_float <= 0:  # Skip zero or negative values
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                
+                    measurement = {
+                        'text': str(text_val) if text_val is not None else '',
+                        'value': value_float,
+                        'unit': str(unit_val) if unit_val is not None else 'FT',
+                        'type': str(type_val) if type_val is not None else 'unknown',
+                        'method': str(method_val) if method_val is not None else 'not_specified'
+                    }
+                    measurements.append(measurement)
+            
                 if measurements:
                     return measurements
-        except json.JSONDecodeError:
-            pass
-        
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # Log the error for debugging
+            st.warning(f"JSON parsing failed for lot measurements: {str(e)}")
+    
         return self._enhanced_fallback_extraction(response)
     
     def _enhanced_fallback_extraction(self, text: str) -> List[Dict]:
@@ -876,32 +894,59 @@ MANDATORY: Use DRIVEWAY text location as the definitive front orientation indica
     def _extract_verified_setback_measurements(self, response: str) -> List[Dict]:
         """Extract only verified dwelling-to-boundary setback measurements"""
         measurements = []
-        
+    
         try:
             json_start = response.find('[')
             json_end = response.rfind(']') + 1
             if json_start != -1 and json_end > json_start:
                 json_content = response[json_start:json_end]
                 raw_data = json.loads(json_content)
-                
+            
                 for item in raw_data:
+                    # Add None checks for all values
+                    text_val = item.get('text', '')
+                    value_val = item.get('value')
+                    unit_val = item.get('unit', 'FT')
+                    type_val = item.get('type', 'unknown')
+                    measurement_type_val = item.get('measurement_type', 'unspecified')
+                    confidence_val = item.get('confidence', 'medium')
+                
+                    # Skip if value is None or not convertible to float
+                    if value_val is None:
+                        continue
+                
+                    try:
+                        value_float = float(value_val)
+                        if value_float <= 0:  # Skip zero or negative values
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                
+                    # Create item dict for validation
+                    validation_item = {
+                        'value': value_float,
+                        'measurement_type': str(measurement_type_val) if measurement_type_val is not None else '',
+                        'type': str(type_val) if type_val is not None else 'unknown'
+                    }
+                
                     # Strict validation for setbacks
-                    if self._validate_setback_measurement(item):
+                    if self._validate_setback_measurement(validation_item):
                         measurement = {
-                            'text': str(item.get('text', '')),
-                            'value': float(item.get('value', 0)),
-                            'unit': str(item.get('unit', 'FT')),
-                            'type': str(item.get('type', 'unknown')),
-                            'measurement_type': str(item.get('measurement_type', 'unspecified')),
-                            'confidence': str(item.get('confidence', 'medium'))
+                            'text': str(text_val) if text_val is not None else '',
+                            'value': value_float,
+                            'unit': str(unit_val) if unit_val is not None else 'FT',
+                            'type': str(type_val) if type_val is not None else 'unknown',
+                            'measurement_type': str(measurement_type_val) if measurement_type_val is not None else 'unspecified',
+                            'confidence': str(confidence_val) if confidence_val is not None else 'medium'
                         }
                         measurements.append(measurement)
-                
+            
                 if measurements:
                     return measurements
-        except json.JSONDecodeError:
-            pass
-        
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # Log the error for debugging
+            st.warning(f"JSON parsing failed for setback measurements: {str(e)}")
+    
         return self._fallback_setback_extraction(response)
     
     def _validate_setback_measurement(self, item: Dict) -> bool:
@@ -1076,30 +1121,50 @@ MANDATORY: Find ALL building dimensions and calculate accurate total area.
     
     def _extract_building_measurements(self, response: str) -> List[Dict]:
         measurements = []
-        
+    
         try:
             json_start = response.find('[')
             json_end = response.rfind(']') + 1
             if json_start != -1 and json_end > json_start:
                 json_content = response[json_start:json_end]
                 raw_data = json.loads(json_content)
-                
+            
                 for item in raw_data:
-                    measurement = {
-                        'text': str(item.get('text', '')),
-                        'value': float(item.get('value', 0)),
-                        'unit': str(item.get('unit', 'FT')),
-                        'type': str(item.get('type', 'unknown')),
-                        'component': str(item.get('component', 'unspecified'))
-                    }
-                    if measurement['value'] > 0 and 'dwelling' in measurement['type']:
-                        measurements.append(measurement)
+                    # Add None checks for all values
+                    text_val = item.get('text', '')
+                    value_val = item.get('value')
+                    unit_val = item.get('unit', 'FT')
+                    type_val = item.get('type', 'unknown')
+                    component_val = item.get('component', 'unspecified')
                 
+                    # Skip if value is None or not convertible to float
+                    if value_val is None:
+                        continue
+                
+                    try:
+                        value_float = float(value_val)
+                        if value_float <= 0:  # Skip zero or negative values
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                
+                    # Only include dwelling-related measurements
+                    if type_val and 'dwelling' in str(type_val).lower():
+                        measurement = {
+                            'text': str(text_val) if text_val is not None else '',
+                            'value': value_float,
+                            'unit': str(unit_val) if unit_val is not None else 'FT',
+                            'type': str(type_val) if type_val is not None else 'unknown',
+                            'component': str(component_val) if component_val is not None else 'unspecified'
+                        }
+                        measurements.append(measurement)
+            
                 if measurements:
                     return measurements
-        except json.JSONDecodeError:
-            pass
-        
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # Log the error for debugging
+            st.warning(f"JSON parsing failed for building measurements: {str(e)}")
+    
         return self._enhanced_building_extraction(response)
     
     def _enhanced_building_extraction(self, text: str) -> List[Dict]:
