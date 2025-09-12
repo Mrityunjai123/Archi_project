@@ -1191,6 +1191,416 @@ MANDATORY: Find ALL building dimensions and calculate accurate total area.
         
         return measurements
 
+class AddressExtractor:
+    """Extract property address from architectural drawings"""
+    
+    def extract_address_from_drawing(self, image_path_or_pil) -> Dict[str, Any]:
+        try:
+            # Same image encoding logic as your existing detectors
+            if isinstance(image_path_or_pil, (str, Path)):
+                with open(image_path_or_pil, "rb") as image_file:
+                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            else:
+                img_buffer = io.BytesIO()
+                if CLOUD_MODE:
+                    w, h = image_path_or_pil.size
+                    if w > 1500 or h > 1500:
+                        scale = min(1500/w, 1500/h)
+                        new_size = (int(w*scale), int(h*scale))
+                        image_path_or_pil = image_path_or_pil.resize(new_size, Image.Resampling.LANCZOS)
+                
+                image_path_or_pil.save(img_buffer, format='PNG', optimize=True)
+                img_buffer.seek(0)
+                base64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            return {'success': False, 'error': f'Failed to encode image: {e}'}
+        
+        address_prompt = """
+        EXTRACT PROPERTY ADDRESS FROM ARCHITECTURAL DRAWING
+        
+        Look for address information in these formats:
+        - "PROPERTY ADDRESS:", "SITE ADDRESS:", "LOT ADDRESS:"
+        - Street numbers followed by street names
+        - Address in title blocks or information panels
+        - "123 Main Street", "45 Oak Avenue", etc.
+        - Look for Livingston Township addresses specifically
+        
+        Return JSON format:
+        {
+            "street_number": "123",
+            "street_name": "Main Street", 
+            "full_address": "123 Main Street",
+            "township": "Livingston",
+            "confidence": "high",
+            "found": true
+        }
+        
+        If no address found, return: {"found": false, "error": "No address detected"}
+        """
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": address_prompt},
+                    {"inline_data": {"mime_type": "image/png", "data": base64_image}}
+                ]
+            }]
+        }
+        
+        try:
+            timeout = 60 if CLOUD_MODE else 90
+            response = requests.post(GEMINI_URL, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                result = response.json()
+                if 'candidates' in result and result['candidates']:
+                    content = result['candidates'][0]['content']['parts'][0]['text']
+                    address_data = self._extract_address_data(content)
+                    return {
+                        'success': True,
+                        'address_data': address_data,
+                        'raw_response': content
+                    }
+            return {'success': False, 'error': f"HTTP {response.status_code}"}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def _extract_address_data(self, response: str) -> Dict:
+        try:
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                json_content = response[json_start:json_end]
+                return json.loads(json_content)
+        except json.JSONDecodeError:
+            pass
+        
+        # Fallback extraction
+        import re
+        address_patterns = [
+            r'(\d+)\s+([A-Za-z\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Court|Ct))',
+            r'PROPERTY\s+ADDRESS[:\s]+(.+)',
+            r'SITE\s+ADDRESS[:\s]+(.+)'
+        ]
+        
+        for pattern in address_patterns:
+            match = re.search(pattern, response, re.IGNORECASE)
+            if match:
+                if len(match.groups()) == 2:  # Street number and name
+                    return {
+                        'street_number': match.group(1),
+                        'street_name': match.group(2).strip(),
+                        'full_address': f"{match.group(1)} {match.group(2).strip()}",
+                        'found': True,
+                        'confidence': 'medium'
+                    }
+                else:  # Full address
+                    full_address = match.group(1).strip()
+                    return {
+                        'full_address': full_address,
+                        'found': True,
+                        'confidence': 'medium'
+                    }
+        
+        return {'found': False, 'error': 'No address pattern matched'}
+
+class TaxMapLotFinder:
+    """Find specific lot dimensions from tax map PDFs"""
+    
+    def __init__(self, tax_map_pdfs_directory):
+        self.tax_maps_dir = tax_map_pdfs_directory
+    
+    def find_lot_by_address(self, address_data) -> Dict[str, Any]:
+        """Find the lot in tax maps using address"""
+        if not address_data.get('found'):
+            return {'success': False, 'error': 'No valid address provided'}
+        
+        # For Livingston Township, we know the structure from your PDFs
+        # The tax map you provided is Sheet 16, so we'll search through available sheets
+        
+        full_address = address_data.get('full_address', '')
+        street_name = address_data.get('street_name', '')
+        
+        # Search through tax map files to find the one containing this address
+        tax_map_files = self._get_tax_map_files()
+        
+        for tax_map_file in tax_map_files:
+            lot_info = self._search_address_in_tax_map(tax_map_file, full_address, street_name)
+            if lot_info.get('success'):
+                return lot_info
+        
+        return {'success': False, 'error': 'Address not found in tax maps'}
+    
+    def _get_tax_map_files(self):
+        """Get list of tax map PDF files"""
+        import os
+        tax_map_files = []
+        if os.path.exists(self.tax_maps_dir):
+            for file in os.listdir(self.tax_maps_dir):
+                if file.endswith('.pdf'):
+                    tax_map_files.append(os.path.join(self.tax_maps_dir, file))
+        return tax_map_files
+    
+    def _search_address_in_tax_map(self, tax_map_path, full_address, street_name):
+        """Search for address in a specific tax map"""
+        try:
+            # Convert tax map PDF to image
+            pdf_converter = PDFtoImageConverter(dpi=200)  # Lower DPI for faster processing
+            images = pdf_converter.convert_pdf_to_images(tax_map_path)
+            
+            if not images:
+                return {'success': False, 'error': 'Could not convert tax map'}
+            
+            # Use first page (most tax maps are single page)
+            tax_map_image = images[0]
+            
+            # Search for the address/street in the tax map
+            search_result = self._find_address_in_image(tax_map_image, full_address, street_name)
+            
+            if search_result.get('success'):
+                # Extract lot dimensions from the same image
+                lot_dimensions = self._extract_lot_dimensions_from_tax_map(
+                    tax_map_image, 
+                    search_result.get('block_number'), 
+                    search_result.get('lot_number')
+                )
+                
+                return {
+                    'success': True,
+                    'tax_map_file': tax_map_path,
+                    'block_number': search_result.get('block_number'),
+                    'lot_number': search_result.get('lot_number'),
+                    'official_dimensions': lot_dimensions,
+                    'sheet_info': search_result.get('sheet_info')
+                }
+            
+            return {'success': False, 'error': 'Address not found in this tax map'}
+            
+        except Exception as e:
+            return {'success': False, 'error': f'Error processing tax map: {str(e)}'}
+    
+    def _find_address_in_image(self, tax_map_image, full_address, street_name):
+        """Use Gemini to find address in tax map image"""
+        try:
+            img_buffer = io.BytesIO()
+            tax_map_image.save(img_buffer, format='PNG', optimize=True)
+            img_buffer.seek(0)
+            base64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            return {'success': False, 'error': f'Image encoding failed: {e}'}
+        
+        address_search_prompt = f"""
+        FIND ADDRESS IN TAX MAP
+        
+        Search for address: "{full_address}" or street: "{street_name}"
+        
+        In this tax map, locate:
+        1. The street name that matches "{street_name}"
+        2. Find the specific lot number for address "{full_address}"
+        3. Identify the block number containing this lot
+        4. Note any sheet reference numbers
+        
+        Look for:
+        - Street names in the map
+        - Lot numbers (small numbers inside parcels)
+        - Block numbers (larger numbers, often in circles or boxes)
+        - Address ranges along streets
+        
+        Return JSON:
+        {{
+            "found": true/false,
+            "block_number": "16",
+            "lot_number": "45", 
+            "street_found": "Bryant Drive",
+            "sheet_info": "Sheet 16",
+            "confidence": "high"
+        }}
+        """
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": address_search_prompt},
+                    {"inline_data": {"mime_type": "image/png", "data": base64_image}}
+                ]
+            }]
+        }
+        
+        try:
+            timeout = 90 if CLOUD_MODE else 120
+            response = requests.post(GEMINI_URL, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                result = response.json()
+                if 'candidates' in result and result['candidates']:
+                    content = result['candidates'][0]['content']['parts'][0]['text']
+                    return self._parse_address_search_result(content)
+            return {'success': False, 'error': f"HTTP {response.status_code}"}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def _extract_lot_dimensions_from_tax_map(self, tax_map_image, block_number, lot_number):
+        """Extract official lot dimensions from tax map"""
+        try:
+            img_buffer = io.BytesIO()
+            tax_map_image.save(img_buffer, format='PNG', optimize=True)
+            img_buffer.seek(0)
+            base64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            return {'success': False, 'error': f'Image encoding failed: {e}'}
+        
+        dimensions_prompt = f"""
+        EXTRACT OFFICIAL LOT DIMENSIONS FROM TAX MAP
+        
+        Focus on Block {block_number}, Lot {lot_number}
+        
+        Find ALL official measurements for this specific lot:
+        1. Lot area (square feet) - often shown as "XXXX SF" or "X.XX AC"
+        2. Lot frontage/width (feet) - dimension along street
+        3. Lot depth (feet) - dimension perpendicular to street  
+        4. All boundary dimensions around the lot perimeter
+        5. Any setback requirements if noted
+        
+        Look for:
+        - Dimensions with ' or " marks (feet/inches)
+        - Area measurements with "SF", "SQ FT", or "AC" 
+        - Numbers along lot boundary lines
+        - Measurements inside or adjacent to the lot parcel
+        
+        Return JSON with all found measurements:
+        {{
+            "lot_area": {{"value": 8500, "unit": "SF"}},
+            "lot_width": {{"value": 75, "unit": "FT"}}, 
+            "lot_depth": {{"value": 120, "unit": "FT"}},
+            "frontage": {{"value": 75, "unit": "FT"}},
+            "all_dimensions": [
+                {{"measurement": "75'", "type": "width", "value": 75}},
+                {{"measurement": "120'", "type": "depth", "value": 120}}
+            ]
+        }}
+        """
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": dimensions_prompt},
+                    {"inline_data": {"mime_type": "image/png", "data": base64_image}}
+                ]
+            }]
+        }
+        
+        try:
+            timeout = 90 if CLOUD_MODE else 120
+            response = requests.post(GEMINI_URL, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                result = response.json()
+                if 'candidates' in result and result['candidates']:
+                    content = result['candidates'][0]['content']['parts'][0]['text']
+                    return self._parse_lot_dimensions(content)
+            return {'success': False, 'error': f"HTTP {response.status_code}"}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    def _parse_address_search_result(self, response: str) -> Dict:
+        try:
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                json_content = response[json_start:json_end]
+                result = json.loads(json_content)
+                result['success'] = result.get('found', False)
+                return result
+        except json.JSONDecodeError:
+            pass
+        return {'success': False, 'error': 'Could not parse search result'}
+    
+    def _parse_lot_dimensions(self, response: str) -> Dict:
+        try:
+            json_start = response.find('{')
+            json_end = response.rfind('}') + 1
+            if json_start != -1 and json_end > json_start:
+                json_content = response[json_start:json_end]
+                return json.loads(json_content)
+        except json.JSONDecodeError:
+            pass
+        return {'success': False, 'error': 'Could not parse dimensions'}
+
+class MeasurementVerifier:
+    """Compare extracted measurements with official tax map data"""
+    
+    def verify_lot_measurements(self, extracted_data, official_data):
+        """Compare lot measurements with tolerance"""
+        if not official_data or not extracted_data:
+            return {'success': False, 'error': 'Missing data for comparison'}
+        
+        verification_results = {}
+        
+        # Compare lot area
+        if official_data.get('lot_area') and extracted_data.get('lot_measurements'):
+            official_area = official_data['lot_area'].get('value')
+            extracted_areas = [m for m in extracted_data['lot_measurements'] if 'area' in m['type']]
+            
+            if extracted_areas and official_area:
+                extracted_area = extracted_areas[0]['value']
+                verification_results['lot_area'] = self._compare_values(
+                    extracted_area, official_area, tolerance_pct=5
+                )
+        
+        # Compare lot width
+        if official_data.get('lot_width') and extracted_data.get('lot_measurements'):
+            official_width = official_data['lot_width'].get('value')
+            extracted_widths = [m for m in extracted_data['lot_measurements'] if 'width' in m['type']]
+            
+            if extracted_widths and official_width:
+                extracted_width = extracted_widths[0]['value']
+                verification_results['lot_width'] = self._compare_values(
+                    extracted_width, official_width, tolerance_pct=3
+                )
+        
+        # Compare lot depth
+        if official_data.get('lot_depth') and extracted_data.get('lot_measurements'):
+            official_depth = official_data['lot_depth'].get('value')
+            extracted_depths = [m for m in extracted_data['lot_measurements'] if 'depth' in m['type']]
+            
+            if extracted_depths and official_depth:
+                extracted_depth = extracted_depths[0]['value']
+                verification_results['lot_depth'] = self._compare_values(
+                    extracted_depth, official_depth, tolerance_pct=3
+                )
+        
+        return {
+            'success': True,
+            'verification_results': verification_results,
+            'official_source': 'Livingston Township Tax Maps',
+            'verification_date': datetime.now().isoformat()
+        }
+    
+    def _compare_values(self, extracted, official, tolerance_pct):
+        """Compare individual measurements with tolerance"""
+        if not extracted or not official:
+            return {'status': 'MISSING_DATA', 'confidence': 'low'}
+        
+        difference_pct = abs(extracted - official) / official * 100
+        difference_abs = abs(extracted - official)
+        
+        if difference_pct <= tolerance_pct:
+            status = 'VERIFIED'
+            confidence = 'high'
+        elif difference_pct <= tolerance_pct * 2:
+            status = 'ACCEPTABLE_VARIANCE'
+            confidence = 'medium'
+        else:
+            status = 'SIGNIFICANT_DISCREPANCY'
+            confidence = 'low'
+        
+        return {
+            'status': status,
+            'confidence': confidence,
+            'extracted_value': extracted,
+            'official_value': official,
+            'difference_pct': difference_pct,
+            'difference_abs': difference_abs,
+            'tolerance_pct': tolerance_pct
+        }
+
 class ZoningTableCompiler:
     """Compile comprehensive zoning analysis from all measurements using Livingston Township requirements"""
     
@@ -2002,6 +2412,84 @@ def main():
                                 )
                                 
                                 st.session_state.analysis_results = analysis_results
+
+                                # NEW VERIFICATION SECTION
+                                st.markdown("---")
+                                st.header("🔍 Step 2.5: Official Tax Map Verification")
+                
+                                col_verify1, col_verify2 = st.columns([1, 1])
+                
+                                with col_verify1:
+                                    st.markdown("**Tax Map Cross-Reference:**")
+                    
+                                    # Tax maps directory configuration
+                                    tax_maps_directory = st.text_input(
+                                        "Tax Maps Directory Path:", 
+                                        value="tax_maps/",
+                                        help="Directory containing Livingston Township tax map PDFs"
+                                    )
+                    
+                                    if st.button("🗺️ Verify with Official Tax Maps", type="primary"):
+                                        with st.spinner("Cross-referencing with official records..."):
+                            
+                                            # Extract address from architectural drawing
+                                            address_extractor = AddressExtractor()
+                                            address_result = address_extractor.extract_address_from_drawing(best_region)
+                            
+                                            if address_result.get('success') and address_result['address_data'].get('found'):
+                                                address_data = address_result['address_data']
+                                                st.success(f"📍 Address found: {address_data.get('full_address', 'N/A')}")
+                                
+                                                # Find lot in tax maps
+                                                tax_map_finder = TaxMapLotFinder(tax_maps_directory)
+                                                lot_result = tax_map_finder.find_lot_by_address(address_data)
+                                
+                                                if lot_result.get('success'):
+                                                    st.success(f"🗺️ Found in tax map: Block {lot_result['block_number']}, Lot {lot_result['lot_number']}")
+                                                    st.info(f"Source: {os.path.basename(lot_result['tax_map_file'])}")
+                                    
+                                                    # Verify measurements
+                                                    verifier = MeasurementVerifier()
+                                                    verification_result = verifier.verify_lot_measurements(
+                                                        analysis_results, lot_result['official_dimensions']
+                                                    )
+                                    
+                                                    if verification_result.get('success'):
+                                                        st.session_state.verification_results = verification_result
+                                                        st.session_state.official_dimensions = lot_result['official_dimensions']
+                                        
+                                                        with col_verify2:
+                                                            st.markdown("**Verification Results:**")
+                                            
+                                                            verification_data = verification_result['verification_results']
+                                            
+                                                            for measurement, result in verification_data.items():
+                                                                status = result['status']
+                                                                if status == 'VERIFIED':
+                                                                    st.success(f"✅ {measurement.replace('_', ' ').title()}: {status}")
+                                                                elif status == 'ACCEPTABLE_VARIANCE':
+                                                                    st.warning(f"⚠️ {measurement.replace('_', ' ').title()}: {status}")
+                                                                else:
+                                                                    st.error(f"❌ {measurement.replace('_', ' ').title()}: {status}")
+                                                
+                                                                st.write(f"   Extracted: {result['extracted_value']}")
+                                                                st.write(f"   Official: {result['official_value']}")
+                                                                st.write(f"   Difference: {result['difference_pct']:.1f}%")
+                                                    else:
+                                                        st.error(f"Verification failed: {verification_result.get('error')}")
+                                                else:
+                                                    st.warning(f"Could not locate lot in tax maps: {lot_result.get('error')}")
+                                                    st.info("This may be due to address extraction issues or incomplete tax map database")
+                                            else:
+                                                st.warning(f"Address extraction failed: {address_result.get('error')}")
+                                                st.info("Manual address input may be needed for tax map verification")
+                    
+                                    # Show debug info if available
+                                    if st.checkbox("Show Address Extraction Debug", key="show_address_debug"):
+                                        if 'address_result' in locals():
+                                            st.text_area("Address Extraction Response", 
+                                                address_result.get('raw_response', 'No response')[:500], 
+                                                height=100)
                                 
                                 # Display results in the second column
                                 with col4:
@@ -2191,7 +2679,57 @@ def main():
         
         # Download Results Section
         st.header("💾 Download Analysis Results")
+
+        # Add verification results display
+        if 'verification_results' in st.session_state:
+            st.subheader("🔍 Official Verification Results")
         
+            verification_data = st.session_state.verification_results.get('verification_results', {})
+            official_dims = st.session_state.get('official_dimensions', {})
+        
+            # Verification summary
+            verified_count = sum(1 for v in verification_data.values() if v['status'] == 'VERIFIED')
+            total_count = len(verification_data)
+        
+            if total_count > 0:
+                col_v1, col_v2, col_v3 = st.columns(3)
+                with col_v1:
+                    st.metric("Verified Measurements", f"{verified_count}/{total_count}")
+                with col_v2:
+                    accuracy = (verified_count / total_count) * 100
+                    st.metric("Verification Rate", f"{accuracy:.1f}%")
+                with col_v3:
+                    discrepancies = sum(1 for v in verification_data.values() if v['status'] == 'SIGNIFICANT_DISCREPANCY')
+                    st.metric("Discrepancies", discrepancies)
+            
+                # Detailed verification table
+                verification_table_data = []
+                for measurement, result in verification_data.items():
+                    verification_table_data.append({
+                        'Measurement': measurement.replace('_', ' ').title(),
+                        'Extracted': result['extracted_value'],
+                        'Official': result['official_value'], 
+                        'Difference %': f"{result['difference_pct']:.1f}%",
+                        'Status': result['status'],
+                        'Confidence': result['confidence']
+                    })
+            
+                if verification_table_data:
+                    df_verify = pd.DataFrame(verification_table_data)
+                
+                    def style_verification_status(val):
+                        if val == 'VERIFIED':
+                            return 'background-color: #d4edda; color: #155724'
+                        elif val == 'ACCEPTABLE_VARIANCE':
+                            return 'background-color: #fff3cd; color: #856404'
+                        else:
+                            return 'background-color: #f8d7da; color: #721c24'
+                
+                    styled_df_verify = df_verify.style.applymap(style_verification_status, subset=['Status'])
+                    st.dataframe(styled_df_verify, use_container_width=True, hide_index=True)
+        else:
+            st.info("No verification data available")
+
         col_download1, col_download2, col_download3 = st.columns(3)
         
         with col_download1:
