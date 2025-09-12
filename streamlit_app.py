@@ -1,4 +1,3 @@
-import os
 import streamlit as st
 import cv2
 import numpy as np
@@ -637,7 +636,39 @@ REJECT building dimensions that are typically 15-50 feet - these are NOT lot mea
             return {'success': False, 'error': f"HTTP {response.status_code}"}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+        
+    def _classify_measurement_context(self, text: str, value: float) -> str:
+        """Classify measurement based on context and value ranges"""
+        text_lower = text.lower()
     
+        # Lot area indicators
+        if value > 5000 and ('area' in text_lower or 'sf' in text_lower or 'acres' in text_lower):
+            return 'lot_area'
+    
+        # Building area indicators  
+        if 500 <= value <= 5000 and ('area' in text_lower or 'footprint' in text_lower):
+            return 'dwelling_area'
+    
+        # Bearing/survey measurements (lot boundaries)
+        if any(bearing in text for bearing in ['°', 'N ', 'S ', 'E ', 'W ']):
+            return 'lot_boundary'
+    
+        # Large distances (likely lot boundaries)
+        if value > 100:
+            return 'lot_boundary'
+    
+        # Medium distances (could be building or setback)
+        if 20 <= value <= 100:
+            if any(word in text_lower for word in ['setback', 'clearance', 'distance']):
+                return 'setback'
+            else:
+                return 'building_dimension'
+    
+        # Small distances (likely building details)
+        if 5 <= value <= 20:
+            return 'building_detail'
+    
+        return 'unknown'
     def _extract_lot_measurements(self, response: str) -> List[Dict]:
         measurements = []
     
